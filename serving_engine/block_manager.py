@@ -15,7 +15,7 @@ class BlockManager:
 
     def can_allocate(self, request: Request) -> bool:
         num_blocks_needed = (request.prompt_len + self.block_size - 1) // self.block_size
-        return num_blocks_needed <= len(self.free_blocks)
+        return num_blocks_needed <= self.get_num_free_blocks()
 
     def allocate(self, request: Request) -> None:
         assert self.can_allocate(request)
@@ -27,7 +27,9 @@ class BlockManager:
             self.blocks[block_id].ref_count += 1
 
     def can_append_slot(self, request: Request) -> bool:
-        return len(self.free_blocks) >= 1
+        if request.total_len % self.block_size != 0:
+            return True
+        return self.get_num_free_blocks() >= 1
 
     # TODO: Handle CoW case
     def append_slot(self, request: Request) -> Optional[int]:
