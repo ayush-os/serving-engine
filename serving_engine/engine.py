@@ -42,8 +42,9 @@ class LLMEngine:
         scheduler_output = self.scheduler.schedule()
         logits = self.model_runner.forward(scheduler_output)
         # TODO: greedy-sample next token per request (argmax -- correctness
-        # oracle needs deterministic match against HF .generate()), append
-        # to output_token_ids, check eos/max_new_tokens for completion.
+        # oracle needs deterministic match against HF .generate()) and
+        # append to output_token_ids. update_after_step() below reads that
+        # to decide phase/finished transitions -- must run after this.
         self.scheduler.update_after_step(scheduler_output)
         return scheduler_output
 
