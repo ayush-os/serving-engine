@@ -1,0 +1,190 @@
+from serving_engine.block_manager import BlockManager
+from serving_engine.request import Request, RequestPhase, RequestStatus
+from serving_engine.scheduler import Scheduler, SchedulerOutput
+
+
+def make_request(request_id, prompt_len, max_new_tokens=256, eos_token_id=None):
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=list(range(prompt_len)),
+        max_new_tokens=max_new_tokens,
+        eos_token_id=eos_token_id,
+    )
+
+
+def make_scheduler(num_gpu_blocks, block_size=4):
+    return Scheduler(BlockManager(num_gpu_blocks=num_gpu_blocks, block_size=block_size))
+
+
+def test_add_request_goes_to_waiting():
+    sched = make_scheduler(num_gpu_blocks=10)
+    req = make_request("a", prompt_len=4)
+
+    sched.add_request(req)
+
+    assert req in sched.waiting
+    assert req not in sched.running
+
+
+def test_schedule_admits_waiting_request_when_capacity_allows():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req = make_request("a", prompt_len=4)
+    sched.add_request(req)
+
+    output = sched.schedule()
+
+    assert req in output.scheduled_requests
+    assert req in sched.running
+    assert req not in sched.waiting
+    assert req.status == RequestStatus.RUNNING
+    assert len(req.block_table) == 1
+
+
+def test_schedule_does_not_admit_when_pool_too_small():
+    sched = make_scheduler(num_gpu_blocks=1, block_size=4)
+    req = make_request("a", prompt_len=8)  # needs 2 blocks, pool has 1
+    sched.add_request(req)
+
+    output = sched.schedule()
+
+    assert output.scheduled_requests == []
+    assert req in sched.waiting
+    assert req not in sched.running
+
+
+def test_schedule_continues_decode_request_with_room_in_last_block():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req = make_request("a", prompt_len=4)
+    sched.add_request(req)
+    sched.schedule()  # admits + prefills, 1 block allocated
+
+    req.phase = RequestPhase.NEEDS_DECODE
+    req.output_token_ids.append(999)  # total_len=5, not a block boundary
+
+    output = sched.schedule()
+
+    assert req in output.scheduled_requests
+    assert len(req.block_table) == 1  # no new block needed
+
+
+def test_schedule_skips_blocked_decode_without_starving_other_candidates():
+    """Regression test for the earlier break-vs-continue bug: one candidate
+    that can't get a block must not prevent later candidates from being
+    scheduled in the same iteration."""
+    sched = make_scheduler(num_gpu_blocks=1, block_size=4)
+
+    blocked = make_request("blocked", prompt_len=4)  # consumes the whole pool
+    sched.add_request(blocked)
+    sched.schedule()
+    blocked.phase = RequestPhase.NEEDS_DECODE
+    blocked.output_token_ids = [1, 2, 3, 4]  # total_len=8, a block boundary -- needs a new block, pool is empty
+
+    other = make_request("other", prompt_len=4)
+    other.phase = RequestPhase.NEEDS_DECODE
+    other.status = RequestStatus.RUNNING
+    other.block_table = [0]
+    other.output_token_ids = [1]  # total_len=5, not a block boundary -- no new block needed
+    sched.running.append(other)
+
+    output = sched.schedule()
+
+    assert blocked not in output.scheduled_requests
+    assert other in output.scheduled_requests
+
+
+def test_schedule_prioritizes_running_over_waiting_when_blocks_are_scarce():
+    sched = make_scheduler(num_gpu_blocks=1, block_size=4)
+
+    running_req = make_request("r", prompt_len=4)
+    running_req.phase = RequestPhase.NEEDS_DECODE
+    running_req.status = RequestStatus.RUNNING
+    sched.running.append(running_req)  # total_len=4, a block boundary -- needs the sole free block
+
+    waiting_req = make_request("w", prompt_len=4)  # also needs 1 block
+    sched.add_request(waiting_req)
+
+    output = sched.schedule()
+
+    assert running_req in output.scheduled_requests
+    assert waiting_req not in output.scheduled_requests
+    assert waiting_req in sched.waiting
+
+
+def test_update_after_step_advances_phase_when_not_finished():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req = make_request("a", prompt_len=4, max_new_tokens=10)
+    sched.block_manager.allocate(req)
+    req.output_token_ids = [1]  # this iteration's prefill step produced 1 token
+
+    sched.update_after_step(SchedulerOutput(scheduled_requests=[req]))
+
+    assert req.phase == RequestPhase.NEEDS_DECODE
+    assert req.status != RequestStatus.FINISHED
+
+
+def test_update_after_step_finishes_on_max_new_tokens():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req = make_request("a", prompt_len=4, max_new_tokens=1)
+    sched.block_manager.allocate(req)
+    sched.running.append(req)
+    req.output_token_ids = [1]  # hits max_new_tokens=1 on the very first (prefill) token
+
+    sched.update_after_step(SchedulerOutput(scheduled_requests=[req]))
+
+    assert req.status == RequestStatus.FINISHED
+    assert req not in sched.running
+    assert req.block_table == []
+    assert sched.block_manager.get_num_free_blocks() == 10
+
+
+def test_update_after_step_finishes_on_eos_during_prefill_iteration():
+    """Regression test: finishing must not be gated on phase == NEEDS_DECODE,
+    or a request that hits EOS on its very first (prefill) token gets
+    scheduled for one extra, unwanted decode step."""
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req = make_request("a", prompt_len=4, max_new_tokens=256, eos_token_id=999)
+    sched.block_manager.allocate(req)
+    sched.running.append(req)
+    req.output_token_ids = [999]
+
+    sched.update_after_step(SchedulerOutput(scheduled_requests=[req]))
+
+    assert req.status == RequestStatus.FINISHED
+    assert req.phase == RequestPhase.NEEDS_PREFILL  # never advanced -- finished first
+    assert req not in sched.running
+
+
+def test_update_after_step_finishes_on_eos_during_decode():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req = make_request("a", prompt_len=4, max_new_tokens=256, eos_token_id=999)
+    sched.block_manager.allocate(req)
+    req.phase = RequestPhase.NEEDS_DECODE
+    req.status = RequestStatus.RUNNING
+    req.output_token_ids = [1, 2, 999]
+    sched.running.append(req)
+
+    sched.update_after_step(SchedulerOutput(scheduled_requests=[req]))
+
+    assert req.status == RequestStatus.FINISHED
+    assert req not in sched.running
+
+
+def test_has_unfinished_requests_true_while_waiting():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    sched.add_request(make_request("a", prompt_len=4))
+
+    assert sched.has_unfinished_requests()
+
+
+def test_has_unfinished_requests_false_once_everything_finishes():
+    """End-to-end regression test for the earlier missing-removal-from-
+    running bug: without it, this loop never terminates."""
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req = make_request("a", prompt_len=4, max_new_tokens=1)
+    sched.add_request(req)
+    output = sched.schedule()
+    req.output_token_ids = [1]
+
+    assert sched.has_unfinished_requests()
+    sched.update_after_step(output)
+    assert not sched.has_unfinished_requests()
