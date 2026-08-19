@@ -41,10 +41,9 @@ class LLMEngine:
         until those are filled in -- that's expected, not a bug here."""
         scheduler_output = self.scheduler.schedule()
         logits = self.model_runner.forward(scheduler_output)
-        # TODO: greedy-sample next token per request (argmax -- correctness
-        # oracle needs deterministic match against HF .generate()) and
-        # append to output_token_ids. update_after_step() below reads that
-        # to decide phase/finished transitions -- must run after this.
+        next_tokens = logits.argmax(dim=-1)
+        for req, tok in zip(scheduler_output.scheduled_requests, next_tokens):
+            req.output_token_ids.append(tok.item())
         self.scheduler.update_after_step(scheduler_output)
         return scheduler_output
 
