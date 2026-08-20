@@ -39,11 +39,22 @@ def generate_workload(
     output_mean: float = 64,
     length_cv: float = 1.0,
     seed: Optional[int] = None,
+    max_prompt_len: Optional[int] = None,
+    max_output_len: Optional[int] = None,
 ) -> List[SyntheticRequest]:
     """Poisson arrivals (rate=arrival_rate req/s) over `duration` seconds of
     wall clock, each with an independently-sampled lognormal prompt/output
     length. Exponential inter-arrival gaps are what makes this a Poisson
-    process, not the sampling loop itself."""
+    process, not the sampling loop itself.
+
+    max_prompt_len/max_output_len clamp the lognormal tail -- matches
+    disagg_and_placement_notes.md Sec 3's own "hard stop, not compaction"
+    admission-policy decision (real deployments cap max context; they
+    don't serve it unbounded). Needed in practice, not just for realism:
+    this engine's eager (non-tiled) attention op's transient memory scales
+    with how long admitted requests' contexts are, not just how many are
+    batched -- an unclamped tail can OOM independent of the scheduler's own
+    max_num_batched_tokens/max_num_seqs caps (see benchmark_load.py)."""
     rng = random.Random(seed)
     prompt_mu, prompt_sigma = _lognormal_params(prompt_mean, length_cv)
     output_mu, output_sigma = _lognormal_params(output_mean, length_cv)
@@ -56,5 +67,9 @@ def generate_workload(
             break
         prompt_len = max(1, round(rng.lognormvariate(prompt_mu, prompt_sigma)))
         output_len = max(1, round(rng.lognormvariate(output_mu, output_sigma)))
+        if max_prompt_len is not None:
+            prompt_len = min(prompt_len, max_prompt_len)
+        if max_output_len is not None:
+            output_len = min(output_len, max_output_len)
         requests.append(SyntheticRequest(arrival_time=t, prompt_len=prompt_len, output_len=output_len))
     return requests

@@ -115,8 +115,13 @@ def run_rate(
     vocab_size: int,
     special_ids: set,
     use_dmon: bool,
+    max_prompt_len: Optional[int],
+    max_output_len: Optional[int],
 ) -> Optional[dict]:
-    workload = generate_workload(duration, rate, prompt_mean, output_mean, length_cv, seed)
+    workload = generate_workload(
+        duration, rate, prompt_mean, output_mean, length_cv, seed,
+        max_prompt_len=max_prompt_len, max_output_len=max_output_len,
+    )
     if not workload:
         print(f"  rate={rate}: no arrivals generated (duration too short for this rate) -- skipping")
         return None
@@ -213,16 +218,28 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-gpu-blocks", type=int, default=None,
                          help="default: auto-size from real free GPU memory")
-    parser.add_argument("--max-num-batched-tokens", type=int, default=2048,
-                         help="bounds total_query in the eager attention op's whole-batch score "
-                              "matrix (see engine.py) -- the fixed startup activation headroom "
-                              "doesn't scale with batch width, so this is the real OOM guard at "
-                              "higher concurrency. Pass 0 to disable (Phase-1-era unbounded behavior).")
-    parser.add_argument("--max-num-seqs", type=int, default=16,
-                         help="bounds total_read (sum of concurrently-running requests' full "
-                              "context lengths) the same way -- decode requests cost only 1 token "
-                              "against --max-num-batched-tokens but still contribute their whole "
-                              "context to the attention op's read side. Pass 0 to disable.")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=1024,
+                         help="bounds total_query (batch WIDTH) in the eager attention op's "
+                              "whole-batch score matrix (see engine.py) -- the fixed startup "
+                              "activation headroom doesn't scale with batch width. Pass 0 to "
+                              "disable (Phase-1-era unbounded behavior).")
+    parser.add_argument("--max-num-seqs", type=int, default=8,
+                         help="bounds how many concurrently-running requests' full context "
+                              "lengths sum into the attention op's read side -- decode requests "
+                              "cost only 1 token against --max-num-batched-tokens but still "
+                              "contribute their whole context here. Pass 0 to disable. Bounding "
+                              "count alone isn't enough -- see --max-prompt-len/--max-output-len, "
+                              "which bound batch DEPTH (how long any one context gets), the other "
+                              "half of what blew the headroom at max_num_batched_tokens=2048/"
+                              "max_num_seqs=16: a handful of long-tail contexts plus one more "
+                              "admitted prefill was enough on its own.")
+    parser.add_argument("--max-prompt-len", type=int, default=1024,
+                         help="clamps the workload generator's lognormal prompt-length tail (see "
+                              "workload.py) -- bounds batch depth, matching "
+                              "disagg_and_placement_notes.md's own hard-cap admission policy. "
+                              "Pass 0 to disable.")
+    parser.add_argument("--max-output-len", type=int, default=256,
+                         help="same clamp, for output length.")
     parser.add_argument("--no-dmon", action="store_true", help="skip nvidia-smi dmon sampling")
     parser.add_argument("--output", type=str, default="benchmark_results.csv")
     args = parser.parse_args()
@@ -240,6 +257,8 @@ def main():
         f"({engine.block_manager.get_num_free_blocks()} free)\n"
         f"Scheduler caps: max_num_batched_tokens={engine.scheduler.max_num_batched_tokens}, "
         f"max_num_seqs={engine.scheduler.max_num_seqs}\n"
+        f"Workload length caps: max_prompt_len={args.max_prompt_len or None}, "
+        f"max_output_len={args.max_output_len or None}\n"
     )
 
     tokenizer = engine.model_runner.tokenizer
@@ -257,6 +276,7 @@ def main():
         result = run_rate(
             engine, rate, args.duration, args.prompt_mean, args.output_mean, args.length_cv,
             args.seed, token_rng, vocab_size, special_ids, use_dmon=not args.no_dmon,
+            max_prompt_len=args.max_prompt_len or None, max_output_len=args.max_output_len or None,
         )
         if result is None:
             continue

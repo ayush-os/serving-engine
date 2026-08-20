@@ -44,6 +44,35 @@ def test_lengths_always_at_least_one_token():
     assert all(r.prompt_len >= 1 and r.output_len >= 1 for r in workload)
 
 
+def test_length_caps_clamp_the_tail():
+    # cap set below the mean so it's guaranteed to bind on most draws, not
+    # just the rare tail -- a strong signal the clamp actually applies
+    # rather than coincidentally never triggering.
+    workload = generate_workload(
+        duration=3000.0, arrival_rate=2.0, prompt_mean=512, output_mean=64,
+        max_prompt_len=100, max_output_len=20, seed=5,
+    )
+
+    assert len(workload) > 0
+    assert all(r.prompt_len <= 100 for r in workload)
+    assert all(r.output_len <= 20 for r in workload)
+    # the cap must have actually bound something, not just happen to be
+    # unreachably high -- otherwise this test would pass vacuously
+    assert any(r.prompt_len == 100 for r in workload)
+
+
+def test_no_caps_means_uncapped():
+    workload = generate_workload(duration=3000.0, arrival_rate=2.0, seed=5)
+    capped = generate_workload(
+        duration=3000.0, arrival_rate=2.0, max_prompt_len=100, max_output_len=20, seed=5,
+    )
+
+    # same seed -- capped run's pre-clamp draws are identical to the
+    # uncapped run's, so the uncapped run must have gone above the cap
+    # somewhere for the clamp to have had anything to do.
+    assert max(r.prompt_len for r in workload) > 100
+
+
 def test_seed_reproducible():
     a = generate_workload(duration=100.0, arrival_rate=4.0, seed=42)
     b = generate_workload(duration=100.0, arrival_rate=4.0, seed=42)
