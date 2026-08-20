@@ -70,7 +70,11 @@ def test_schedule_continues_decode_request_with_room_in_last_block():
 def test_schedule_skips_blocked_decode_without_starving_other_candidates():
     """Regression test for the earlier break-vs-continue bug: one candidate
     that can't get a block must not prevent later candidates from being
-    scheduled in the same iteration."""
+    scheduled in the same iteration. Also covers the eviction-scoping rule:
+    since `other` is still making progress, this isn't a true stall, so
+    `blocked` must simply wait rather than force an eviction -- forcing one
+    here would waste a recompute that isn't actually necessary, since
+    `other` will eventually finish and free its block naturally."""
     sched = make_scheduler(num_gpu_blocks=1, block_size=4)
 
     blocked = make_request("blocked", prompt_len=4)  # consumes the whole pool
@@ -90,6 +94,7 @@ def test_schedule_skips_blocked_decode_without_starving_other_candidates():
 
     assert blocked not in output.scheduled_requests
     assert other in output.scheduled_requests
+    assert output.preempted_requests == []
 
 
 def test_schedule_prioritizes_running_over_waiting_when_blocks_are_scarce():
@@ -108,6 +113,58 @@ def test_schedule_prioritizes_running_over_waiting_when_blocks_are_scarce():
     assert running_req in output.scheduled_requests
     assert waiting_req not in output.scheduled_requests
     assert waiting_req in sched.waiting
+
+
+def test_schedule_evicts_lifo_victim_on_true_stall():
+    """Every running request simultaneously blocked on the pool, nothing
+    scheduled at all -- a real stall, not just one unlucky candidate.
+    Evicting the most recently admitted request must free exactly enough
+    room for the earliest-blocked one to proceed this same step."""
+    sched = make_scheduler(num_gpu_blocks=2, block_size=4)
+
+    needs_room = make_request("needs_room", prompt_len=4)  # admitted first
+    sched.block_manager.allocate(needs_room)
+    needs_room.phase = RequestPhase.NEEDS_DECODE
+    needs_room.status = RequestStatus.RUNNING
+    needs_room.output_token_ids = [1, 2, 3, 4]  # total_len=8, a block boundary -- needs a new block
+    sched.running.append(needs_room)
+
+    victim = make_request("victim", prompt_len=4)  # admitted more recently -- the LIFO victim
+    sched.block_manager.allocate(victim)
+    victim.phase = RequestPhase.NEEDS_DECODE
+    victim.status = RequestStatus.RUNNING
+    victim.output_token_ids = [1, 2, 3, 4]  # also total_len=8, also blocked -- true stall, pool is 0/2 free
+    sched.running.append(victim)
+
+    output = sched.schedule()
+
+    assert needs_room in output.scheduled_requests
+    assert len(needs_room.block_table) == 2, "should have consumed victim's freed block"
+
+    assert victim in output.preempted_requests
+    assert victim not in output.scheduled_requests, "must not be re-admitted in the same step it was evicted"
+    assert victim in sched.waiting
+    assert victim not in sched.running
+    assert victim.block_table == []
+    assert victim.phase == RequestPhase.NEEDS_PREFILL
+    assert victim.status == RequestStatus.PREEMPTED
+
+
+def test_schedule_skips_decode_when_no_eviction_victim_available():
+    sched = make_scheduler(num_gpu_blocks=1, block_size=4)
+
+    only = make_request("only", prompt_len=4)
+    sched.block_manager.allocate(only)
+    only.phase = RequestPhase.NEEDS_DECODE
+    only.status = RequestStatus.RUNNING
+    only.output_token_ids = [1, 2, 3, 4]  # total_len=8, a boundary -- needs a block, pool has 0 free
+    sched.running.append(only)
+
+    output = sched.schedule()
+
+    assert output.scheduled_requests == []
+    assert output.preempted_requests == []
+    assert only in sched.running, "nothing to evict -- stays put for a future step, not a crash"
 
 
 def test_update_after_step_advances_phase_when_not_finished():
