@@ -256,6 +256,26 @@ def test_schedule_respects_max_num_batched_tokens_cap():
     assert req_b in sched.waiting
 
 
+def test_schedule_admits_lone_candidate_that_exceeds_the_token_cap_alone():
+    """Regression test: found via Phase 2's real load sweep, where a
+    lognormal-tailed synthetic prompt exceeded max_num_batched_tokens on
+    its own. Before this fix, the token-cap check applied even at
+    num_batched_tokens==0, so a candidate whose own cost alone exceeds the
+    cap could never be scheduled -- not now, not ever, regardless of how
+    idle the rest of the system was. It's a NEEDS_PREFILL candidate, so it
+    never reaches blocked_decode_candidates either, meaning nothing could
+    ever unstick it: permanent starvation, silently returning an empty
+    scheduled_requests forever."""
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4, max_num_batched_tokens=4)
+    huge = make_request("huge", prompt_len=10)  # cost=10, already over the cap=4 alone
+    sched.add_request(huge)
+
+    output = sched.schedule()
+
+    assert output.scheduled_requests == [huge]
+    assert huge not in sched.waiting
+
+
 def test_schedule_running_decode_still_prioritized_under_token_cap():
     """The token cap must not let a plain first-come-first-served candidate
     order starve in-flight decode work -- running is still scanned before
@@ -279,23 +299,34 @@ def test_schedule_running_decode_still_prioritized_under_token_cap():
 
 
 def test_schedule_token_cap_blocked_candidate_does_not_trigger_eviction():
-    """A candidate skipped for being over the token budget is a scheduling
-    choice, not a resource stall -- it must not be treated as eviction
-    bait the way a genuine block-capacity block is."""
-    sched = make_scheduler(num_gpu_blocks=2, block_size=4, max_num_batched_tokens=0)
+    """A second candidate skipped for being over the (already partially
+    spent) token budget is a scheduling choice, not a resource stall -- it
+    must not be treated as eviction bait the way a genuine block-capacity
+    block is. Uses two candidates, not one: a lone candidate is always
+    admitted regardless of its own cost (see the "always admit the first
+    candidate" fix in schedule()) specifically so a single request can
+    never starve forever just because its cost alone exceeds the cap."""
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4, max_num_batched_tokens=1)
 
-    only = make_request("only", prompt_len=4)
-    only.phase = RequestPhase.NEEDS_DECODE
-    only.status = RequestStatus.RUNNING
-    sched.block_manager.allocate(only)
-    only.output_token_ids = [1, 2, 3, 4]  # total_len=8, a boundary -- would need a new block if it got that far
-    sched.running.append(only)
+    first = make_request("first", prompt_len=1)
+    first.phase = RequestPhase.NEEDS_DECODE
+    first.status = RequestStatus.RUNNING
+    sched.block_manager.allocate(first)
+    first.output_token_ids = [1]
+    sched.running.append(first)  # admitted -- spends the whole budget (cost=1)
+
+    second = make_request("second", prompt_len=1)
+    second.phase = RequestPhase.NEEDS_DECODE
+    second.status = RequestStatus.RUNNING
+    sched.block_manager.allocate(second)
+    second.output_token_ids = [1]
+    sched.running.append(second)  # budget already spent -- skipped by the cap, not by block capacity
 
     output = sched.schedule()
 
-    assert output.scheduled_requests == []
+    assert output.scheduled_requests == [first]
     assert output.preempted_requests == []
-    assert only in sched.running
+    assert second in sched.running
 
 
 def test_has_unfinished_requests_true_while_waiting():

@@ -54,7 +54,18 @@ class Scheduler:
             cost = 1 if candidate.phase == RequestPhase.NEEDS_DECODE else candidate.total_len
             if self.max_num_seqs is not None and num_seqs >= self.max_num_seqs:
                 continue
-            if self.max_num_batched_tokens is not None and num_batched_tokens + cost > self.max_num_batched_tokens:
+            # The token-budget check only limits piling more work on top of
+            # something already batched this step (num_batched_tokens > 0).
+            # A lone candidate whose own cost exceeds the cap still has to
+            # get in when nothing else is competing for the budget --
+            # otherwise a single prompt longer than max_num_batched_tokens
+            # would never be schedulable under any circumstance, forever
+            # (no chunked prefill here to split it across iterations).
+            if (
+                self.max_num_batched_tokens is not None
+                and num_batched_tokens > 0
+                and num_batched_tokens + cost > self.max_num_batched_tokens
+            ):
                 continue
 
             if candidate.phase == RequestPhase.NEEDS_DECODE:

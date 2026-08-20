@@ -81,6 +81,15 @@ class LLMEngine:
         model_runner.forward(), so this will raise NotImplementedError
         until those are filled in -- that's expected, not a bug here."""
         scheduler_output = self.scheduler.schedule()
+        if not scheduler_output.scheduled_requests:
+            # A genuine block-capacity stall with no eviction victim
+            # available (e.g. a lone running request needs one more block
+            # than the pool has left) can still return nothing to do.
+            # forward() has no real batch to run in that case -- calling it
+            # anyway builds an empty token tensor, which torch.tensor([])
+            # defaults to float32, crashing embed_tokens on a dtype it
+            # never asked for. Skip the forward pass entirely instead.
+            return scheduler_output
         logits = self.model_runner.forward(scheduler_output)
         next_tokens = logits.argmax(dim=-1)
         for req, tok in zip(scheduler_output.scheduled_requests, next_tokens):
