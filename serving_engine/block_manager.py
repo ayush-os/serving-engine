@@ -1,7 +1,7 @@
 from typing import Optional
 
 from serving_engine.block import BLOCK_SIZE, Block
-from serving_engine.request import Request
+from serving_engine.request import Request, RequestPhase, RequestStatus
 
 
 class BlockManager:
@@ -14,12 +14,12 @@ class BlockManager:
         self.free_blocks = list(range(num_gpu_blocks))
 
     def can_allocate(self, request: Request) -> bool:
-        num_blocks_needed = (request.prompt_len + self.block_size - 1) // self.block_size
+        num_blocks_needed = (request.total_len + self.block_size - 1) // self.block_size
         return num_blocks_needed <= self.get_num_free_blocks()
 
     def allocate(self, request: Request) -> None:
         assert self.can_allocate(request)
-        num_blocks_needed = (request.prompt_len + self.block_size - 1) // self.block_size
+        num_blocks_needed = (request.total_len + self.block_size - 1) // self.block_size
 
         for _ in range(num_blocks_needed):
             block_id = self.free_blocks.pop()
@@ -58,4 +58,7 @@ class BlockManager:
         return len(self.free_blocks)
 
     def preempt(self, request: Request) -> None:
-        raise NotImplementedError  # TODO
+        self.free(request)
+        request.num_computed_tokens = 0
+        request.phase = RequestPhase.NEEDS_PREFILL
+        request.status = RequestStatus.PREEMPTED

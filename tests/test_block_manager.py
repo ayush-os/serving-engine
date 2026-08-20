@@ -1,5 +1,5 @@
 from serving_engine.block_manager import BlockManager
-from serving_engine.request import Request
+from serving_engine.request import Request, RequestPhase, RequestStatus
 
 
 def make_request(request_id: str, prompt_len: int) -> Request:
@@ -82,3 +82,33 @@ def test_fork_child_block_table_is_independent_list():
 
     assert len(parent.block_table) == 1, "child append_slot must not mutate parent's block_table"
     assert len(child.block_table) == 2
+
+
+def test_allocate_sizes_by_total_len_not_prompt_len():
+    """A recompute after preemption needs blocks for prompt + everything
+    already generated, not just the prompt -- allocate() must size off
+    total_len, or a recompute-prefill would run out of blocks mid-forward."""
+    bm = BlockManager(num_gpu_blocks=10)
+    req = make_request("a", prompt_len=8)
+    req.output_token_ids = list(range(10))  # total_len=18, ceil(18/16)=2 blocks
+    assert bm.can_allocate(req)
+    bm.allocate(req)
+    assert len(req.block_table) == 2
+
+
+def test_preempt_frees_blocks_and_resets_request_for_recompute():
+    bm = BlockManager(num_gpu_blocks=10)
+    req = make_request("a", prompt_len=16)
+    req.output_token_ids = [1, 2, 3]
+    req.num_computed_tokens = 19
+    req.phase = RequestPhase.NEEDS_DECODE
+    req.status = RequestStatus.RUNNING
+    bm.allocate(req)
+
+    bm.preempt(req)
+
+    assert req.block_table == []
+    assert bm.get_num_free_blocks() == 10
+    assert req.num_computed_tokens == 0
+    assert req.phase == RequestPhase.NEEDS_PREFILL
+    assert req.status == RequestStatus.PREEMPTED
