@@ -25,14 +25,30 @@ class LLMEngine:
         self.scheduler = Scheduler(self.block_manager)
         self.requests = {}
 
-    def add_request(self, prompt: str, max_new_tokens: int = 256) -> str:
+    def add_request(
+        self,
+        prompt: str = None,
+        max_new_tokens: int = 256,
+        prompt_token_ids: List[int] = None,
+        ignore_eos: bool = False,
+    ) -> str:
+        """prompt_token_ids/ignore_eos exist for scripts/benchmark_load.py:
+        Phase 2's synthetic workload needs exact, pre-sampled prompt/output
+        token counts (see workload.py) rather than real text -- content
+        doesn't affect prefill/decode compute cost, only token count does.
+        ignore_eos forces every request to run its full sampled output
+        length instead of stopping early on a randomly-sampled EOS token,
+        so the realized output-length distribution matches what was
+        sampled, not something the simulator this is compared against
+        never modeled."""
         request_id = str(uuid.uuid4())
-        prompt_token_ids = self.model_runner.tokenizer.encode(prompt)
+        if prompt_token_ids is None:
+            prompt_token_ids = self.model_runner.tokenizer.encode(prompt)
         request = Request(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             max_new_tokens=max_new_tokens,
-            eos_token_id=self.model_runner.tokenizer.eos_token_id,
+            eos_token_id=None if ignore_eos else self.model_runner.tokenizer.eos_token_id,
         )
         self.requests[request_id] = request
         self.scheduler.add_request(request)
