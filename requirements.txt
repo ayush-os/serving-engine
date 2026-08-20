@@ -1,4 +1,4 @@
 torch
-transformers
+transformers>=4.43  # Llama-3.1's rope_scaling format (rope_type: llama3) needs this floor
 accelerate
 pytest
