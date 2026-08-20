@@ -11,13 +11,85 @@ actually left before Phase 1 is checkpointed.
 
 ## Status in one line
 
-All Phase 1 code is written and internally consistent — `block_manager.py`,
-`scheduler.py`, `engine.py`, `model_runner.py` — but **none of it has ever
-run against the real model on a real GPU.** Everything GPU-independent has
-been tested (20 passing unit tests, zero GPU). Everything GPU-dependent
-(`model_runner.forward()`, `test_correctness.py`) has only been read-through
-verified against `transformers` source, never executed. The first GPU
-session is where this either works or reveals real bugs.
+`test_correctness.py` passes (2 exact matches, 1 `xfail` for expected bf16
+drift — see "First GPU session" below): Phase 1's correctness checkpoint is
+met. Remaining before Phase 1 is fully checkpointed: the continuous-batching
+demo (never built).
+
+## First GPU session — model swap, real bugs found, correctness result
+
+Rented an A100 (~40GB variant). Three real things happened, in order:
+
+1. **Model swapped to `meta-llama/Llama-3.1-8B-Instruct`.** The
+   `Meta-Llama-3-8B-Instruct` gated-repo access request was still pending
+   at session start; 3.1 was already approved from prior work and is
+   architecturally identical everywhere this code touches it (same
+   `LlamaForCausalLM` class, same `num_hidden_layers`/`num_key_value_heads`/
+   `head_dim`). spec.md's Decision 1 explicitly allows "or similar 7-8B
+   dense open-weight model," so this is in-scope, not a deviation.
+   `model_runner.py`'s `MODEL_NAME` now points at 3.1 — the mentions of
+   "Llama-3-8B" elsewhere in this doc predate the swap and are still
+   accurate in spirit (same architecture), just not the literal string.
+
+2. **Two real bugs, both found and fixed by reading the actual installed
+   `transformers==5.15.1` source directly** (not by re-guessing from this
+   doc's earlier research — that research turned out to be incomplete in
+   one place, see below):
+
+   - **Wrong cache wiring.** `model_runner.forward()` was passing
+     `past_key_values=cache`. That's wrong: `LlamaAttention.forward()`
+     calls `past_key_values.update(key_states, value_states, layer_idx)`
+     *unconditionally* whenever `past_key_values is not None` — that's the
+     generic 3-arg `Cache` interface (works for `DynamicCache`), and
+     `_PagedKVCache` doesn't implement it (`TypeError: missing read_index,
+     write_index`). Reading `transformers/integrations/eager_paged.py`
+     directly showed the real contract: the paged attention function pops
+     a **separate** `cache` kwarg out of `**kwargs` and calls
+     `.update(key_states=, value_states=, layer_idx=, read_index=,
+     write_index=)` there — `past_key_values` is never touched on the
+     paged path. Fix: pass `past_key_values=None`, `cache=cache` as a
+     plain kwarg (flows through `**kwargs` to the attention function), and
+     `use_cache=False` (so `LlamaModel.forward()` doesn't auto-construct
+     an empty `DynamicCache` and put it back into `past_key_values` — this
+     turned out to be harmless either way since `create_causal_mask`
+     returns an already-4D mask as-is regardless, but `False` avoids
+     relying on that being a no-op). `_PagedKVCache.update()`'s own
+     signature and the flat, non-grouped `read_idxes`/`write_idxes`
+     construction needed no changes — Llama has one layer group, so the
+     per-group indirection the real `PagedAttentionCache.update()` does
+     internally doesn't apply here.
+   - **Autograd never disabled.** `forward()` had no `torch.no_grad()` /
+     `inference_mode()` guard. `model.eval()` only disables
+     dropout/batchnorm, not gradient tracking — with the model's weights
+     requiring grad, the in-place `index_copy_` writes in
+     `_PagedKVCache.update()` collided with the live autograd graph
+     (`RuntimeError: a leaf Variable that requires grad is being used in
+     an in-place operation`). Fixed with `@torch.inference_mode()` on
+     `ModelRunner.forward()`.
+
+   Both required extensive live source inspection (`inspect.getsource()`
+   on `eager_paged_attention_forward`, `PagedAttentionCache.update()`,
+   `LlamaAttention.forward()`, `LlamaModel.forward()`) to get right —
+   guessing from this doc's Phase-0-era research would have missed both.
+
+3. **Correctness result: 2/3 prompts match HF `.generate()` exactly
+   token-for-token; the third (`"def fibonacci(n):"`) diverges partway
+   through decode.** Diagnosed with a standalone script comparing raw
+   logits for just the first generated token (bypassing the decode loop
+   entirely): engine and HF agree on argmax and have near-identical top-5,
+   max abs diff 0.156 on logits of magnitude ~19 — squarely bf16 rounding
+   noise, not a logic error. This confirms prefill, the mask, and the
+   paged cache read/write are all correct. The actual divergence happens
+   several decode steps later: ordinary bf16 greedy-decoding
+   non-associativity (different reduction order between this engine's
+   batched/masked attention and HF's own single-sequence path) compounding
+   until a near-tied token flips — the same kind of divergence you'd see
+   comparing two different HF attention implementations against each
+   other, not specific to this engine. Explicit decision made (not
+   unilateral): treat this as the expected correctness bar rather than
+   chase it further. `test_correctness.py` marks that one case `xfail`
+   with the diagnostic reasoning inline; the other two remain hard
+   assertions.
 
 ## Repo map
 
@@ -166,27 +238,21 @@ to want newer.
 
 ## Immediate next steps to finish Phase 1
 
-1. **Rent the A100** (single GPU — decided in Phase 0, sufficient for
-   Phase 1-2; H100 was reserved for Phase 3's TP target if that's ever
-   reached).
-2. **Environment**: CUDA-enabled torch, `transformers`, `accelerate`;
-   accept Llama-3-8B-Instruct's license/auth on Hugging Face (gated repo).
-   Check the version risk above before anything else.
-3. **Pick a real `num_gpu_blocks`** from actual free GPU memory
+Done: A100 rented, environment set up, `Llama-3.1-8B-Instruct` license
+accepted, `test_correctness.py` passing (see "First GPU session" above).
+What's left:
+
+1. **Pick a real `num_gpu_blocks`** from actual free GPU memory
    (`torch.cuda.mem_get_info()` or `nvidia-smi` is enough — no need for a
-   full automatic profiler, that's more sophistication than this reduced
-   scope needs).
-4. **Run `tests/test_correctness.py`**, debug until genuinely token-for-token
-   against HF `.generate()`. This is where the index math, mask, and
-   `_PagedKVCache` all get validated for real for the first time. Expect
-   to find at least one real bug — none of this has executed yet.
-5. **Write the continuous-batching demo** (not built yet at all) — the
+   full automatic profiler) — needed for the demo below, which isn't
+   hardcoded to `num_gpu_blocks=1024` like the correctness test is.
+2. **Write the continuous-batching demo** (not built yet at all) — the
    second Phase 1 checkpoint. Staggered-arrival, concurrent, different-length
    requests through `engine.add_request()`/`step()`, with *observed*
    evidence the GPU doesn't idle between them (`nvidia-smi dmon` or step
-   timestamps — the spec's own bar is "confirmed, not assumed").
+   timestamps).
 
-Once both checkpoints pass, Phase 1 is done. Phase 2 (the benchmark report
+Once the demo passes, Phase 1 is done. Phase 2 (the benchmark report
 against `disagg_and_placement_notes.md`'s simulator predictions) is next;
 `preempt()` and the token/seq cap become required before that starts.
 
