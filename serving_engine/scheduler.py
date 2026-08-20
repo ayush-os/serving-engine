@@ -15,8 +15,15 @@ class Scheduler:
     """Per-iteration admission loop: prefill/decode mix, gated by
     BlockManager capacity. Yours."""
 
-    def __init__(self, block_manager: BlockManager):
+    def __init__(
+        self,
+        block_manager: BlockManager,
+        max_num_batched_tokens: int | None = None,
+        max_num_seqs: int | None = None,
+    ):
         self.block_manager = block_manager
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_num_seqs = max_num_seqs
         self.waiting: List[Request] = []
         self.running: List[Request] = []
 
@@ -31,27 +38,41 @@ class Scheduler:
                 return req
         return None
 
-    # TODO: enforce max_num_batched_tokens/max_num_seqs
     def schedule(self) -> SchedulerOutput:
         output = SchedulerOutput()
         # running before waiting: in-flight decode work is deliberately
         # prioritized over admitting new requests when blocks are scarce.
         candidates = self.running.copy() + self.waiting.copy()
         blocked_decode_candidates = []
+        num_batched_tokens = 0
+        num_seqs = 0
 
         for candidate in candidates:
+            # A decode step computes 1 new token; a prefill computes the
+            # whole prompt in one shot (no chunked prefill here), so its
+            # cost against the per-iteration token budget is its full length.
+            cost = 1 if candidate.phase == RequestPhase.NEEDS_DECODE else candidate.total_len
+            if self.max_num_seqs is not None and num_seqs >= self.max_num_seqs:
+                continue
+            if self.max_num_batched_tokens is not None and num_batched_tokens + cost > self.max_num_batched_tokens:
+                continue
+
             if candidate.phase == RequestPhase.NEEDS_DECODE:
                 if not self.block_manager.can_append_slot(candidate):
                     blocked_decode_candidates.append(candidate)
                     continue
                 self.block_manager.append_slot(candidate)
                 output.scheduled_requests.append(candidate)
+                num_seqs += 1
+                num_batched_tokens += cost
             elif candidate.phase == RequestPhase.NEEDS_PREFILL and self.block_manager.can_allocate(candidate):
                 self.block_manager.allocate(candidate)
                 output.scheduled_requests.append(candidate)
                 candidate.status = RequestStatus.RUNNING
                 self.waiting = [r for r in self.waiting if r is not candidate]
                 self.running.append(candidate)
+                num_seqs += 1
+                num_batched_tokens += cost
 
         # Last resort: nothing at all advanced this step, so the pool is
         # genuinely exhausted with every candidate blocked on it -- without

@@ -12,8 +12,12 @@ def make_request(request_id, prompt_len, max_new_tokens=256, eos_token_id=None):
     )
 
 
-def make_scheduler(num_gpu_blocks, block_size=4):
-    return Scheduler(BlockManager(num_gpu_blocks=num_gpu_blocks, block_size=block_size))
+def make_scheduler(num_gpu_blocks, block_size=4, max_num_batched_tokens=None, max_num_seqs=None):
+    return Scheduler(
+        BlockManager(num_gpu_blocks=num_gpu_blocks, block_size=block_size),
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
+    )
 
 
 def test_add_request_goes_to_waiting():
@@ -224,6 +228,74 @@ def test_update_after_step_finishes_on_eos_during_decode():
 
     assert req.status == RequestStatus.FINISHED
     assert req not in sched.running
+
+
+def test_schedule_respects_max_num_seqs_cap():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4, max_num_seqs=1)
+    req_a = make_request("a", prompt_len=4)
+    req_b = make_request("b", prompt_len=4)
+    sched.add_request(req_a)
+    sched.add_request(req_b)
+
+    output = sched.schedule()
+
+    assert output.scheduled_requests == [req_a]
+    assert req_b in sched.waiting, "ample blocks but at the seq cap -- must wait, not error"
+
+
+def test_schedule_respects_max_num_batched_tokens_cap():
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4, max_num_batched_tokens=4)
+    req_a = make_request("a", prompt_len=4)  # exactly consumes the token budget
+    req_b = make_request("b", prompt_len=4)  # nothing left for this one
+    sched.add_request(req_a)
+    sched.add_request(req_b)
+
+    output = sched.schedule()
+
+    assert output.scheduled_requests == [req_a]
+    assert req_b in sched.waiting
+
+
+def test_schedule_running_decode_still_prioritized_under_token_cap():
+    """The token cap must not let a plain first-come-first-served candidate
+    order starve in-flight decode work -- running is still scanned before
+    waiting, so a tight budget is spent on the decode step first."""
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4, max_num_batched_tokens=1)
+
+    running_req = make_request("r", prompt_len=4)
+    running_req.phase = RequestPhase.NEEDS_DECODE
+    running_req.status = RequestStatus.RUNNING
+    sched.block_manager.allocate(running_req)
+    running_req.output_token_ids = [1]
+    sched.running.append(running_req)  # decode step costs 1 token -- exactly the whole budget
+
+    waiting_req = make_request("w", prompt_len=4)  # a fresh prefill costs 4 tokens, no budget left regardless
+    sched.add_request(waiting_req)
+
+    output = sched.schedule()
+
+    assert output.scheduled_requests == [running_req]
+    assert waiting_req in sched.waiting
+
+
+def test_schedule_token_cap_blocked_candidate_does_not_trigger_eviction():
+    """A candidate skipped for being over the token budget is a scheduling
+    choice, not a resource stall -- it must not be treated as eviction
+    bait the way a genuine block-capacity block is."""
+    sched = make_scheduler(num_gpu_blocks=2, block_size=4, max_num_batched_tokens=0)
+
+    only = make_request("only", prompt_len=4)
+    only.phase = RequestPhase.NEEDS_DECODE
+    only.status = RequestStatus.RUNNING
+    sched.block_manager.allocate(only)
+    only.output_token_ids = [1, 2, 3, 4]  # total_len=8, a boundary -- would need a new block if it got that far
+    sched.running.append(only)
+
+    output = sched.schedule()
+
+    assert output.scheduled_requests == []
+    assert output.preempted_requests == []
+    assert only in sched.running
 
 
 def test_has_unfinished_requests_true_while_waiting():
