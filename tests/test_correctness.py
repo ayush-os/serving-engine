@@ -44,9 +44,11 @@ def test_matches_hf_generate(hf_reference, prompt):
     expected = hf_generate(model, tokenizer, prompt, MAX_NEW_TOKENS)
 
     engine = LLMEngine(num_gpu_blocks=1024)
-    [actual] = engine.generate([prompt], max_new_tokens=MAX_NEW_TOKENS)
-    del engine
-    gc.collect()
-    torch.cuda.empty_cache()
+    try:
+        [actual] = engine.generate([prompt], max_new_tokens=MAX_NEW_TOKENS)
+    finally:
+        del engine
+        gc.collect()
+        torch.cuda.empty_cache()
 
     assert actual == expected

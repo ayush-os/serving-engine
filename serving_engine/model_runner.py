@@ -68,6 +68,7 @@ class ModelRunner:
         """Physical flat position in self.kv_cache for a request's logical_pos-th token."""
         return block_table[logical_pos // self.block_size] * self.block_size + logical_pos % self.block_size
 
+    @torch.inference_mode()
     def forward(self, scheduler_output) -> torch.Tensor:
         """Batched forward pass over a SchedulerOutput's requests: one
         combined call mixing prefill and decode tokens, gathering/scattering
