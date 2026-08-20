@@ -1,7 +1,10 @@
 """Phase 1's second checkpoint: demonstrate continuous batching -- a new,
 staggered-arrival request gets folded into the batch mid-decode of an
-already-running one, instead of waiting for it to finish. Run directly
-(not via pytest):
+already-running one, instead of waiting for it to finish. Then compares
+total wall time against a naive baseline with no iteration-level batching
+at all (each request runs alone, start to finish, before the next is
+admitted) to show the actual speedup, not just that admission didn't stall.
+Run directly (not via pytest):
 
     python scripts/continuous_batching_demo.py
 
@@ -10,9 +13,16 @@ What to look for in the output:
     in the same batch line as another request's ongoing DECODE -- that's
     the actual point of continuous batching, not just multiple requests
     existing at once.
-  - the nvidia-smi dmon utilization samples at the end should show
-    sustained (not intermittently zero) SM utilization across the whole
-    run, confirming the GPU wasn't sitting idle between requests.
+  - the nvidia-smi dmon utilization samples should show sustained (not
+    intermittently zero) SM utilization across the run.
+  - the final comparison: naive-sequential wall time vs. continuous-batched
+    wall time for the same 3 requests. The speedup comes from decode being
+    memory-bandwidth-bound, not compute-bound -- batching several
+    sequences' decode into one step costs about the same wall time as one
+    sequence alone, so continuous batching needs fewer total steps to
+    finish the same workload. With only 3 requests here the speedup is
+    real but modest; it grows with concurrency, which is more Phase 2's
+    territory than this demo's.
 """
 import shutil
 import subprocess
@@ -28,9 +38,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from serving_engine.engine import LLMEngine
 
 # (prompt, max_new_tokens, arrival_step) -- arrival_step is which
-# engine.step() call this request is added before. Staggering arrivals
-# (rather than adding everything up front) is what actually exercises
-# continuous batching instead of just ordinary static batching.
+# engine.step() call this request is added before, used only by the
+# continuous-batching trial. The naive trial ignores arrival_step: with no
+# batching at all, when a request "arrives" doesn't change the naive
+# server's total completion time, since nothing can ever overlap anyway.
 REQUESTS = [
     ("Write a short story about a robot learning to paint.", 60, 0),
     ("What is 2 + 2?", 10, 5),
@@ -38,25 +49,9 @@ REQUESTS = [
 ]
 
 
-def main():
-    print("Loading model and sizing KV cache pool from free GPU memory...")
-    engine = LLMEngine(num_gpu_blocks=None)
-    print(
-        f"KV cache pool: {engine.model_runner.num_gpu_blocks} blocks "
-        f"({engine.block_manager.get_num_free_blocks()} free)\n"
-    )
-
-    dmon = None
-    if shutil.which("nvidia-smi"):
-        dmon = subprocess.Popen(
-            ["nvidia-smi", "dmon", "-s", "u", "-d", "1"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    else:
-        print("nvidia-smi not found -- skipping GPU utilization sampling.\n")
-
+def run_continuous_batched(engine) -> float:
+    """Staggered arrivals through add_request()/step() -- the scheduler
+    folds each new arrival into whatever's already running."""
     pending_arrivals = sorted(REQUESTS, key=lambda r: r[2])
     seen_request_ids = set()
     step_idx = 0
@@ -87,7 +82,56 @@ def main():
         step_idx += 1
 
     total_wall = time.monotonic() - t_start
-    print(f"\nTotal wall time for {len(REQUESTS)} staggered requests over {step_idx} steps: {total_wall:.2f}s")
+    print(f"\nContinuous-batched: {len(REQUESTS)} staggered requests over {step_idx} steps in {total_wall:.2f}s")
+    return total_wall
+
+
+def run_naive_sequential(engine) -> float:
+    """No iteration-level batching: each request runs alone, start to
+    finish, before the next is admitted -- the baseline continuous
+    batching is meant to beat."""
+    t_start = time.monotonic()
+    for prompt, max_new_tokens, _ in REQUESTS:
+        t0 = time.monotonic()
+        engine.generate([prompt], max_new_tokens=max_new_tokens)
+        print(f"  {time.monotonic() - t0:5.2f}s  {prompt!r}")
+
+    total_wall = time.monotonic() - t_start
+    print(f"\nNaive sequential: {len(REQUESTS)} requests, one at a time, in {total_wall:.2f}s")
+    return total_wall
+
+
+def main():
+    print("Loading model and sizing KV cache pool from free GPU memory...")
+    engine = LLMEngine(num_gpu_blocks=None)
+    print(
+        f"KV cache pool: {engine.model_runner.num_gpu_blocks} blocks "
+        f"({engine.block_manager.get_num_free_blocks()} free)\n"
+    )
+
+    # Whichever trial runs first eats one-time CUDA kernel/allocator
+    # warm-up cost (first-ever step is ~20x slower than steady-state) --
+    # run one throwaway request now so that cost lands here, not inside
+    # whichever trial happens to go first below.
+    print("Warming up...")
+    engine.generate(["Hello"], max_new_tokens=1)
+
+    dmon = None
+    if shutil.which("nvidia-smi"):
+        dmon = subprocess.Popen(
+            ["nvidia-smi", "dmon", "-s", "u", "-d", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    else:
+        print("nvidia-smi not found -- skipping GPU utilization sampling.\n")
+
+    print("=== Continuous batching (staggered arrivals) ===")
+    continuous_wall = run_continuous_batched(engine)
+
+    print("\n=== Naive sequential (no iteration-level batching) ===")
+    naive_wall = run_naive_sequential(engine)
 
     if dmon is not None:
         dmon.terminate()
@@ -96,8 +140,11 @@ def main():
         except subprocess.TimeoutExpired:
             dmon.kill()
             out, _ = dmon.communicate()
-        print("\nnvidia-smi dmon utilization samples during the run (sm% column):")
+        print("\nnvidia-smi dmon utilization samples across the whole run (sm% column):")
         print(out)
+
+    print(f"\n=== Result: {naive_wall / continuous_wall:.2f}x speedup from continuous batching "
+          f"({naive_wall:.2f}s naive -> {continuous_wall:.2f}s continuous) ===")
 
 
 if __name__ == "__main__":
