@@ -50,8 +50,6 @@ class ModelRunner:
         # TODO: one combined call over all scheduled tokens (prefill and
         # decode mixed), attn_implementation="paged|eager" (reads/writes
         # self.kv_cache via a cache object's .update(), not the attention fn)
-        # - attention_mask so each token only attends within its own
-        #   request's valid range of the flattened batch
         # - reassemble logits by request_id, matching scheduled_requests'
         #   order (not by concatenation order)
 
@@ -59,7 +57,12 @@ class ModelRunner:
         req_spans = []
         write_idxes = []
         read_idxes = []
-        for req in scheduler_output.scheduled_requests:
+        position_ids = []  # per query token, logical position within its own request
+        query_group = []   # per query token, index into scheduled_requests
+        key_positions = []  # per read/key entry, logical position within its own request
+        key_group = []       # per read/key entry, index into scheduled_requests
+
+        for group_idx, req in enumerate(scheduler_output.scheduled_requests):
             start = len(toks)
             if req.phase == RequestPhase.NEEDS_PREFILL:
                 toks += req.prompt_token_ids
@@ -72,8 +75,29 @@ class ModelRunner:
 
             for logical_pos in write_positions:
                 write_idxes.append(self._flat_slot(req.block_table, logical_pos))
+                position_ids.append(logical_pos)
+                query_group.append(group_idx)
             for logical_pos in read_positions:
                 read_idxes.append(self._flat_slot(req.block_table, logical_pos))
+                key_positions.append(logical_pos)
+                key_group.append(group_idx)
             req_spans.append((req, start, len(toks)))
+
+        position_ids_t = torch.tensor(position_ids, device=self.device)
+        query_group_t = torch.tensor(query_group, device=self.device)
+        key_positions_t = torch.tensor(key_positions, device=self.device)
+        key_group_t = torch.tensor(key_group, device=self.device)
+
+        # allowed[i, j]: can query token i attend to read/key entry j?
+        # -- same request, and the key's position doesn't come after the query's own position.
+        same_request = query_group_t[:, None] == key_group_t[None, :]
+        causal = key_positions_t[None, :] <= position_ids_t[:, None]
+        allowed = same_request & causal
+
+        attention_mask = torch.zeros(len(toks), len(read_idxes), dtype=self.dtype, device=self.device)
+        attention_mask.masked_fill_(~allowed, torch.finfo(self.dtype).min)
+        attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, total_query, total_read]
+
+        position_ids_for_model = position_ids_t.unsqueeze(0)  # [1, total_query]
 
         raise NotImplementedError
