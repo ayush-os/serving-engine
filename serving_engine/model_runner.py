@@ -5,6 +5,28 @@ from serving_engine.request import RequestPhase
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 
+class _PagedKVCache:
+    """Duck-typed cache object: LlamaAttention.forward() calls .update() once
+    per layer, per forward pass. Wraps ModelRunner's physical self.kv_cache."""
+
+    def __init__(self, kv_cache: torch.Tensor):
+        self.kv_cache = kv_cache  # [num_layers, 2, num_gpu_blocks, block_size, num_kv_heads, head_dim]
+        self.num_kv_heads = kv_cache.shape[-2]
+        self.head_dim = kv_cache.shape[-1]
+
+    def update(self, key_states, value_states, layer_idx, read_index, write_index):
+        key_states = key_states.transpose(1, 2).squeeze(0)  # [seqlen, num_kv_heads, head_dim]
+        value_states = value_states.transpose(1, 2).squeeze(0)
+
+        k_cache = self.kv_cache[layer_idx, 0].view(-1, self.num_kv_heads, self.head_dim)
+        v_cache = self.kv_cache[layer_idx, 1].view(-1, self.num_kv_heads, self.head_dim)
+
+        k_cache.index_copy_(0, write_index, key_states)
+        v_cache.index_copy_(0, write_index, value_states)
+
+        return torch.index_select(k_cache, 0, read_index), torch.index_select(v_cache, 0, read_index)
+
+
 class ModelRunner:
     """Wraps the reused HF model/tokenizer (Decision 3: model internals are
     not the point, only the batching/memory orchestration around them is).
@@ -27,6 +49,7 @@ class ModelRunner:
             model_name, torch_dtype=dtype
         ).to(device)
         self.model.eval()
+        self.model.set_attn_implementation("paged|eager")
         self.block_size = block_size
 
         cfg = self.model.config
@@ -46,12 +69,9 @@ class ModelRunner:
         return block_table[logical_pos // self.block_size] * self.block_size + logical_pos % self.block_size
 
     def forward(self, scheduler_output) -> torch.Tensor:
-        """Batched forward pass over a SchedulerOutput's requests."""
-        # TODO: one combined call over all scheduled tokens (prefill and
-        # decode mixed), attn_implementation="paged|eager" (reads/writes
-        # self.kv_cache via a cache object's .update(), not the attention fn)
-        # - reassemble logits by request_id, matching scheduled_requests'
-        #   order (not by concatenation order)
+        """Batched forward pass over a SchedulerOutput's requests: one
+        combined call mixing prefill and decode tokens, gathering/scattering
+        self.kv_cache via _PagedKVCache.update() inside each attention layer."""
 
         toks = []
         req_spans = []
@@ -100,4 +120,21 @@ class ModelRunner:
 
         position_ids_for_model = position_ids_t.unsqueeze(0)  # [1, total_query]
 
-        raise NotImplementedError
+        write_idxes_t = torch.tensor(write_idxes, device=self.device)
+        read_idxes_t = torch.tensor(read_idxes, device=self.device)
+        input_ids = torch.tensor(toks, device=self.device).unsqueeze(0)  # [1, total_query]
+
+        cache = _PagedKVCache(self.kv_cache)
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids_for_model,
+            past_key_values=cache,
+            read_index=read_idxes_t,
+            write_index=write_idxes_t,
+            use_cache=True,
+        )
+
+        last_token_logits = {req.request_id: outputs.logits[0, end - 1] for req, _, end in req_spans}
+        return torch.stack([last_token_logits[req.request_id] for req in scheduler_output.scheduled_requests])
