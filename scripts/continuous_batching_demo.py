@@ -16,7 +16,14 @@ What to look for in the output:
 """
 import shutil
 import subprocess
+import sys
 import time
+from pathlib import Path
+
+# Run as a plain script (`python scripts/continuous_batching_demo.py`), so
+# only scripts/ lands on sys.path by default -- add the repo root so
+# serving_engine is importable without needing `-m` or an editable install.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from serving_engine.engine import LLMEngine
 from serving_engine.request import RequestPhase
