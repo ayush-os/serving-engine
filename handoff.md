@@ -7,7 +7,9 @@ scope) — this doc covers everything *since* Phase 0 that spec.md doesn't
 capture: real implementation decisions, bugs found and fixed, and what's
 actually left before Phase 2 is checkpointed.
 
-**Repo:** https://github.com/ayush-os/serving-engine (public), 22 commits on `main`.
+**Repo:** https://github.com/ayush-os/serving-engine (public), 44+ commits on
+`main` as of this doc — check `git log` for the current count, it'll be
+stale immediately.
 
 ## Status in one line
 
@@ -95,33 +97,43 @@ Rented an A100 (~40GB variant). Three real things happened, in order:
    with the diagnostic reasoning inline; the other two remain hard
    assertions.
 
-## Repo map
+## Repo map (current as of this doc)
 
 ```
 serving_engine/
-  block.py           BLOCK_SIZE=16, Block dataclass — done, no known issues
-  request.py         Request/RequestPhase/RequestStatus — done
-  block_manager.py   allocate/append_slot/free/fork done + tested.
-                      preempt() and append_slot's CoW branch deliberately
-                      stubbed (see "Deliberately deferred" below)
-  scheduler.py        schedule()/update_after_step() done + tested.
-                      max_num_batched_tokens/max_num_seqs cap deliberately
-                      not enforced yet (see below)
+  block.py           BLOCK_SIZE=16, Block dataclass — done, no known issues.
+  request.py         Request/RequestPhase/RequestStatus — done.
+  block_manager.py   allocate/append_slot/free/fork/preempt all done, GPU-
+                      verified. Only append_slot's CoW branch still stubbed
+                      (deliberately, see "Deliberately deferred" below).
+  scheduler.py        schedule()/update_after_step() done, GPU-verified.
+                      Last-resort LIFO eviction + max_num_batched_tokens/
+                      max_num_seqs cap both implemented and enforced.
   model_runner.py     ModelRunner + _PagedKVCache + forward() — fully
-                      written, ZERO GPU runs so far. The riskiest file.
-  engine.py           LLMEngine wiring — done, untested end-to-end (needs
-                      a real forward() run)
+                      written, GPU-verified (correctness + preemption
+                      recompute both confirmed). No known issues.
+  engine.py           LLMEngine wiring — done, GPU-verified end-to-end
+                      (generate(), step(), num_gpu_blocks=None auto-sizing).
+scripts/
+  continuous_batching_demo.py    Phase 1's 2nd checkpoint: staggered
+                      arrivals + naive-vs-continuous speedup comparison.
+                      Run directly: python scripts/continuous_batching_demo.py
+  preemption_sanity_check.py     GPU sanity check for preempt()/eviction --
+                      forces a real eviction deterministically, asserts it
+                      fired, checks outputs are coherent post-recompute.
 tests/
-  test_block_manager.py   8 tests, pure Python, no torch/GPU — passing
-  test_scheduler.py        12 tests, pure Python, no torch/GPU — passing
-  test_correctness.py       Phase 1's actual checkpoint (token-for-token vs
-                      HF .generate()) — needs a real GPU + real weights,
-                      never run
-.venv/                local venv for the two GPU-free test files. transformers
-                      5.15.1 got pip-installed into it during research (see
-                      "Version risk" below) — this is NOT what runs on the
-                      rented GPU, just what the design was verified against.
+  test_block_manager.py   11 tests, pure Python, no torch/GPU — passing.
+  test_scheduler.py        18 tests, pure Python, no torch/GPU — passing.
+  test_correctness.py       Phase 1's checkpoint (token-for-token vs HF
+                      .generate()) — GPU-verified, 2 pass exactly, 1 xfail
+                      (confirmed bf16 drift, not a bug -- see below).
+.venv/                 local venv for the pure-Python test files only
+                      (no torch). NOT what runs on the GPU box.
 ```
+
+On the GPU box: always use an isolated `.venv-gpu` virtualenv (`python -m
+venv .venv-gpu`), never the shared system Python — see "Second GPU session"
+below for why (ABI conflicts with pre-loaded packages on a fresh box).
 
 ## The real story of `model_runner.forward()` — why it looks the way it does
 
@@ -302,6 +314,26 @@ section). Marked 🧠 in spec.md — this phase is meant to be judgment-heavy,
 not just scaffolding: the actual point is a real, checked comparison
 against your own prior prediction, not a demo to build and move past.
 
+**`disagg_and_placement_notes.md` is NOT in this repo** — it's Phase 0 work
+that lives elsewhere (the user has it). Needed before step 1 can start for
+real; don't guess at its distributional assumptions or the ~4,138 req/s
+figure below beyond what's already written down here.
+
+**Division of labor for Phase 2, explicitly decided (not the Phase 1
+default carried over blindly)**: steps 1-2 below are boilerplate/scaffolding
+— synthetic load generation and a measurement harness, the same category of
+work as `scripts/continuous_batching_demo.py` and
+`scripts/preemption_sanity_check.py`, both of which Claude wrote directly
+with no back-and-forth needed. **Step 3 is different and should NOT be
+offloaded the same way.** It's marked 🧠 in spec.md specifically because
+it's judgment-heavy, not scaffolding — and per the missing-doc point above,
+Claude doesn't have `disagg_and_placement_notes.md`'s actual modeling
+assumptions to reason from even if it wanted to. The plan: Claude builds
+1-2 and hands back raw numbers; the predicted-vs-real interpretation in 3
+happens as a sounding-board conversation (same pattern as the eviction
+policy decision in the second GPU session), not as a Claude-authored
+writeup.
+
 **Per spec.md's Phase 2 section:**
 1. Build a synthetic request generator matching the same distributional
    assumptions the discrete-event simulator used (`disagg_and_placement_notes.md`
@@ -325,11 +357,25 @@ load sweep.
 
 ## How this session worked, for continuity
 
-- Division of labor: the user writes the actual algorithmic logic
-  (block manager internals, scheduler admission loop, the index math in
-  `forward()`); Claude handles scaffolding, boilerplate, source-verified
-  research (reading real `transformers` internals rather than guessing),
-  writing test files, and reviews.
+- Division of labor, refined in the second GPU session: not a strict "user
+  writes all algorithmic logic" split — once a real design fork is
+  explicitly resolved (see next bullet), Claude implements the mechanical
+  result directly, including in `block_manager.py`/`scheduler.py` (e.g. the
+  `total_len`-vs-`prompt_len` sizing fix, the last-resort eviction wiring,
+  the block-growth invariant fix). The line that matters is: genuine
+  *design* decisions get surfaced, not silently made either way.
+- **Real forks get surfaced explicitly, not silently resolved.** When
+  eager-vs-last-resort eviction came up, Claude didn't just pick one — it
+  was framed as an actual decision with tradeoffs and asked about directly
+  (see commit `96bc229`'s message for the reasoning once resolved). Same
+  pattern expected for Phase 2's predicted-vs-real writeup (see "Immediate
+  next steps" above) and for anything else that's a judgment call rather
+  than a mechanical consequence of an already-settled decision.
+- `spec.md` is a starting point, not a constraint to defer to reflexively —
+  said explicitly by the user mid-session. Don't treat its exact wording
+  (e.g. "token-for-token") as unable to flex when a real finding (e.g. bf16
+  drift) warrants it — but don't silently deviate either; that's also a
+  "surface it" moment, same as the bullet above.
 - Review style: conceptual/logic bugs get Socratic guiding questions, not
   direct answers — syntax/typo-level mistakes get fixed directly, no
   ceremony. This produced several real caught bugs (see commit messages).
@@ -337,8 +383,13 @@ load sweep.
   (pure-Python unit tests for `block_manager`/`scheduler`, zero torch
   dependency) — GPU time is expensive/limited, so it should only be spent
   validating what genuinely can't be checked any other way.
+- GPU workflow: this chat environment has no direct GPU access. The pattern
+  is Claude gives exact copy-paste shell commands, the user runs them on
+  the rented box and pastes output back, Claude reads/diagnoses from that.
+  Expect to iterate this way for Phase 2's load sweep too.
 - Commit style: small, narrated commits matching the actual build sequence
   (not squashed) — "more commits the merrier," each with a real commit
-  message explaining the *why*, not just the *what*.
+  message explaining the *why*, not just the *what*. Push after every
+  commit (or small batch) rather than batching a long series unpushed.
 - Comment style: terse. TODO markers stay one line, no restated context —
   established explicitly after an early draft was judged "too much hint."
