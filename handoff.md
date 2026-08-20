@@ -1,20 +1,24 @@
-# Handoff — serving-engine, end of Phase 1 implementation
+# Handoff — serving-engine, Phase 1 complete, starting Phase 2
 
 Written so a fresh chat session (or future you) can pick up exactly where
 this one left off, without re-deriving anything already settled. Read
 `spec.md` first for the project's overall shape (phases, decisions,
 scope) — this doc covers everything *since* Phase 0 that spec.md doesn't
 capture: real implementation decisions, bugs found and fixed, and what's
-actually left before Phase 1 is checkpointed.
+actually left before Phase 2 is checkpointed.
 
 **Repo:** https://github.com/ayush-os/serving-engine (public), 22 commits on `main`.
 
 ## Status in one line
 
-`test_correctness.py` passes (2 exact matches, 1 `xfail` for expected bf16
-drift — see "First GPU session" below): Phase 1's correctness checkpoint is
-met. Remaining before Phase 1 is fully checkpointed: the continuous-batching
-demo (never built).
+**Phase 1 is fully checkpointed.** `test_correctness.py` passes (2 exact
+matches, 1 `xfail` for expected bf16 drift — see "First GPU session"
+below). `scripts/continuous_batching_demo.py` demonstrates staggered
+arrivals folding into an already-running batch (observed in the per-step
+timeline, not assumed) and measures a 1.71x wall-time speedup over a
+naive-sequential baseline on a 3-request run, with sustained non-zero
+`nvidia-smi dmon` SM utilization throughout. Phase 2 is next — see
+"Immediate next steps" at the bottom, now pointed at Phase 2 instead.
 
 ## First GPU session — model swap, real bugs found, correctness result
 
@@ -236,25 +240,45 @@ still match what's described above. Consider pinning `transformers==5.15.1`
 in `requirements.txt` to remove this risk entirely, unless there's a reason
 to want newer.
 
-## Immediate next steps to finish Phase 1
+## Immediate next steps — Phase 1 is done, Phase 2 is next
 
-Done: A100 rented, environment set up, `Llama-3.1-8B-Instruct` license
-accepted, `test_correctness.py` passing (see "First GPU session" above).
-What's left:
+Phase 1's two checkpoints (correctness, continuous-batching demo) are both
+met — see "Status in one line" above. Phase 2 is the benchmark report
+against `disagg_and_placement_notes.md`'s simulator predictions (spec.md's
+Phase 2 section). Marked 🧠 in spec.md — this phase is meant to be
+judgment-heavy, not just scaffolding: the actual point is a real, checked
+comparison against your own prior prediction, not a demo to build and move
+past.
 
-1. **Pick a real `num_gpu_blocks`** from actual free GPU memory
-   (`torch.cuda.mem_get_info()` or `nvidia-smi` is enough — no need for a
-   full automatic profiler) — needed for the demo below, which isn't
-   hardcoded to `num_gpu_blocks=1024` like the correctness test is.
-2. **Write the continuous-batching demo** (not built yet at all) — the
-   second Phase 1 checkpoint. Staggered-arrival, concurrent, different-length
-   requests through `engine.add_request()`/`step()`, with *observed*
-   evidence the GPU doesn't idle between them (`nvidia-smi dmon` or step
-   timestamps).
+**Required before the load sweep starts** (both currently stubbed, see
+"Deliberately deferred" above — this is exactly the situation they were
+deferred *until*):
+1. **`block_manager.py`'s `preempt()`** — still raises `NotImplementedError`.
+   A real swept-load benchmark will exhaust the block pool; without
+   preemption that's an unhandled crash, not a measurement.
+2. **`scheduler.py`'s `max_num_batched_tokens`/`max_num_seqs` cap** — still
+   unenforced. An uncapped huge-prefill iteration during the sweep would
+   contaminate the exact compute-ceiling-vs-KV-pool measurement Phase 2
+   exists to make.
 
-Once the demo passes, Phase 1 is done. Phase 2 (the benchmark report
-against `disagg_and_placement_notes.md`'s simulator predictions) is next;
-`preempt()` and the token/seq cap become required before that starts.
+**Then, per spec.md's Phase 2 section:**
+3. Build a synthetic request generator matching the same distributional
+   assumptions the discrete-event simulator used (`disagg_and_placement_notes.md`
+   §4) — Poisson arrivals, a realistic prompt/output-length distribution —
+   so results are actually comparable to the simulator's predictions, not a
+   different workload shape.
+4. Measure real throughput (req/s), TTFT, per-token decode latency, and GPU
+   occupancy under a swept load.
+5. Write the predicted-vs-real comparison: the simulator found prefill's
+   fixed compute ceiling (~4,138 req/s in that setup), not decode capacity
+   or the KV pool, was the real bottleneck. Does real hardware confirm that
+   shape, or does something the simulator's abstraction missed show up for
+   real (kernel launch overhead, scheduling overhead, memory fragmentation)?
+   A genuine, checked answer either way is the actual checkpoint —
+   disagreement here is a more interesting finding than agreement.
+
+`append_slot`'s CoW branch stays deferred indefinitely — still nothing
+exercises `fork()`/prefix-sharing, unaffected by Phase 2.
 
 ## How this session worked, for continuity
 
