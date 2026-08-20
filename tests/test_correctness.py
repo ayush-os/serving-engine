@@ -3,7 +3,10 @@
 greedy decoding (do_sample=False) -- the engine has no sampling logic
 beyond argmax, so this is the only fair comparison.
 """
+import gc
+
 import pytest
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from serving_engine.engine import LLMEngine
@@ -42,5 +45,8 @@ def test_matches_hf_generate(hf_reference, prompt):
 
     engine = LLMEngine(num_gpu_blocks=1024)
     [actual] = engine.generate([prompt], max_new_tokens=MAX_NEW_TOKENS)
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
 
     assert actual == expected
