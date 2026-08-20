@@ -26,7 +26,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from serving_engine.engine import LLMEngine
-from serving_engine.request import RequestPhase
 
 # (prompt, max_new_tokens, arrival_step) -- arrival_step is which
 # engine.step() call this request is added before. Staggering arrivals
@@ -59,6 +58,7 @@ def main():
         print("nvidia-smi not found -- skipping GPU utilization sampling.\n")
 
     pending_arrivals = sorted(REQUESTS, key=lambda r: r[2])
+    seen_request_ids = set()
     step_idx = 0
     t_start = time.monotonic()
 
@@ -72,10 +72,16 @@ def main():
         scheduler_output = engine.step()
         dt_ms = (time.monotonic() - t0) * 1000
 
-        batch = [
-            f"{req.request_id[:8]}:{'PREFILL' if req.phase == RequestPhase.NEEDS_PREFILL else 'DECODE'}"
-            for req in scheduler_output.scheduled_requests
-        ]
+        # engine.step() flips req.phase NEEDS_PREFILL -> NEEDS_DECODE in
+        # place before returning, on the same Request objects listed here --
+        # so reading .phase now would always show DECODE. Track "seen
+        # before" ourselves instead to label each request's actual first
+        # scheduled step as PREFILL.
+        batch = []
+        for req in scheduler_output.scheduled_requests:
+            label = "PREFILL" if req.request_id not in seen_request_ids else "DECODE"
+            seen_request_ids.add(req.request_id)
+            batch.append(f"{req.request_id[:8]}:{label}")
         print(f"[step {step_idx:3d}] {dt_ms:6.1f}ms  batch=[{', '.join(batch)}]")
 
         step_idx += 1
