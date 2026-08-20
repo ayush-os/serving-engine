@@ -26,14 +26,28 @@ class BlockManager:
             request.block_table.append(block_id)
             self.blocks[block_id].ref_count += 1
 
+    def _has_capacity_for(self, request: Request) -> bool:
+        """Whether the request's current block_table already covers
+        total_len -- checked directly against actual capacity rather than
+        derived from total_len % block_size, which silently assumes the
+        table grew via a specific incremental history (one block at a
+        time, starting from allocate()'s own ceil(total_len/block_size)).
+        That assumption breaks whenever total_len is an exact multiple of
+        block_size at admission time -- true after any preemption
+        recompute, but also just a fresh prompt whose length happens to
+        land on a block boundary -- silently leaving the table one block
+        short for the very next decode step (IndexError in
+        ModelRunner._flat_slot)."""
+        return len(request.block_table) * self.block_size >= request.total_len
+
     def can_append_slot(self, request: Request) -> bool:
-        if request.total_len % self.block_size != 0:
+        if self._has_capacity_for(request):
             return True
         return self.get_num_free_blocks() >= 1
 
     # TODO: Handle CoW case
     def append_slot(self, request: Request) -> Optional[int]:
-        if request.total_len % self.block_size != 0:
+        if self._has_capacity_for(request):
             return None
 
         assert self.can_append_slot(request)

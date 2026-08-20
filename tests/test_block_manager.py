@@ -24,7 +24,8 @@ def test_can_allocate_respects_capacity():
 def test_append_slot_consumes_one_block():
     bm = BlockManager(num_gpu_blocks=10)
     req = make_request("a", prompt_len=16)
-    bm.allocate(req)
+    bm.allocate(req)  # 1 block, capacity=16
+    req.output_token_ids = [1]  # total_len=17, exceeds current capacity -- a real decode step needs a new block
     free_before = bm.get_num_free_blocks()
     bm.append_slot(req)
     assert bm.get_num_free_blocks() == free_before - 1
@@ -77,6 +78,7 @@ def test_fork_child_block_table_is_independent_list():
     bm.allocate(parent)
     child = make_request("c", prompt_len=16)
     bm.fork(parent, child)
+    child.output_token_ids = [1]  # total_len=17, exceeds the forked capacity -- needs a new block
 
     bm.append_slot(child)
 
@@ -112,3 +114,25 @@ def test_preempt_frees_blocks_and_resets_request_for_recompute():
     assert req.num_computed_tokens == 0
     assert req.phase == RequestPhase.NEEDS_PREFILL
     assert req.status == RequestStatus.PREEMPTED
+
+
+def test_boundary_aligned_admission_gets_room_for_the_next_decode_step():
+    """Regression test for a real GPU crash: allocate() sizes exactly
+    ceil(total_len/block_size) blocks with no headroom. When total_len at
+    admission time is an exact multiple of block_size -- true after any
+    preemption recompute, or just a fresh prompt whose length happens to
+    land on a block boundary -- the very next decode step needs a block
+    that was never provisioned, and ModelRunner._flat_slot indexes past
+    the end of block_table. can_append_slot/append_slot must check real
+    capacity against total_len directly, not the total_len % block_size
+    shortcut, which silently assumed a specific incremental-growth
+    history that allocate() doesn't follow."""
+    bm = BlockManager(num_gpu_blocks=10, block_size=16)
+    req = make_request("a", prompt_len=16)  # exactly one block, no headroom
+    bm.allocate(req)
+    assert len(req.block_table) == 1
+
+    req.output_token_ids = [1]  # total_len=17 -- write position 16 needs a 2nd block
+    assert bm.can_append_slot(req)
+    bm.append_slot(req)
+    assert len(req.block_table) == 2, "must have grown -- position 16 isn't covered by 1 block"

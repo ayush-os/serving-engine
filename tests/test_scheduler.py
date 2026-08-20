@@ -58,12 +58,12 @@ def test_schedule_does_not_admit_when_pool_too_small():
 
 def test_schedule_continues_decode_request_with_room_in_last_block():
     sched = make_scheduler(num_gpu_blocks=10, block_size=4)
-    req = make_request("a", prompt_len=4)
+    req = make_request("a", prompt_len=3)  # ceil(3/4)=1 block, capacity=4 -- one slot of room before growth
     sched.add_request(req)
     sched.schedule()  # admits + prefills, 1 block allocated
 
     req.phase = RequestPhase.NEEDS_DECODE
-    req.output_token_ids.append(999)  # total_len=5, not a block boundary
+    req.output_token_ids.append(999)  # total_len=4, still within the 1 block's capacity
 
     output = sched.schedule()
 
@@ -81,17 +81,17 @@ def test_schedule_skips_blocked_decode_without_starving_other_candidates():
     `other` will eventually finish and free its block naturally."""
     sched = make_scheduler(num_gpu_blocks=1, block_size=4)
 
-    blocked = make_request("blocked", prompt_len=4)  # consumes the whole pool
+    blocked = make_request("blocked", prompt_len=3)  # consumes the whole pool
     sched.add_request(blocked)
-    sched.schedule()
+    sched.schedule()  # ceil(3/4)=1 block, capacity=4
     blocked.phase = RequestPhase.NEEDS_DECODE
-    blocked.output_token_ids = [1, 2, 3, 4]  # total_len=8, a block boundary -- needs a new block, pool is empty
+    blocked.output_token_ids = [1, 2]  # total_len=5, exceeds capacity=4 -- needs a new block, pool is empty
 
-    other = make_request("other", prompt_len=4)
+    other = make_request("other", prompt_len=3)
     other.phase = RequestPhase.NEEDS_DECODE
     other.status = RequestStatus.RUNNING
-    other.block_table = [0]
-    other.output_token_ids = [1]  # total_len=5, not a block boundary -- no new block needed
+    other.block_table = [0]  # capacity=4 -- sufficient on its own, so this never touches the real pool
+    other.output_token_ids = [1]  # total_len=4, within capacity -- no new block needed
     sched.running.append(other)
 
     output = sched.schedule()
