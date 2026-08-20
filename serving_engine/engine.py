@@ -15,10 +15,13 @@ class LLMEngine:
     in scheduler.py and block_manager.py.
     """
 
-    def __init__(self, num_gpu_blocks: int, model_name: str = None):
+    def __init__(self, num_gpu_blocks: int | None = None, model_name: str = None):
+        """num_gpu_blocks=None sizes the KV cache pool from actual free GPU
+        memory (see ModelRunner._infer_num_gpu_blocks) instead of a fixed
+        count -- BlockManager is sized to match whatever ModelRunner resolves."""
         kwargs = {"model_name": model_name} if model_name else {}
         self.model_runner = ModelRunner(num_gpu_blocks, BLOCK_SIZE, **kwargs)
-        self.block_manager = BlockManager(num_gpu_blocks, BLOCK_SIZE)
+        self.block_manager = BlockManager(self.model_runner.num_gpu_blocks, BLOCK_SIZE)
         self.scheduler = Scheduler(self.block_manager)
         self.requests = {}
 

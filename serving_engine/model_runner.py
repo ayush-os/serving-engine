@@ -34,11 +34,12 @@ class ModelRunner:
 
     def __init__(
         self,
-        num_gpu_blocks: int,
+        num_gpu_blocks: int | None,
         block_size: int,
         model_name: str = MODEL_NAME,
         device: str = "cuda",
         dtype=torch.bfloat16,
+        gpu_memory_utilization: float = 0.9,
     ):
         self.device = device
         self.dtype = dtype
@@ -46,13 +47,20 @@ class ModelRunner:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype
+            model_name, dtype=dtype
         ).to(device)
         self.model.eval()
         self.model.set_attn_implementation("paged|eager")
         self.block_size = block_size
 
         cfg = self.model.config
+        # Free memory must be read here: after weights are loaded (a fixed
+        # baseline that has to be subtracted first) but before the cache
+        # tensor below claims any of it.
+        if num_gpu_blocks is None:
+            num_gpu_blocks = self._infer_num_gpu_blocks(cfg, dtype, gpu_memory_utilization)
+        self.num_gpu_blocks = num_gpu_blocks
+
         self.kv_cache = torch.zeros(
             cfg.num_hidden_layers,
             2,  # K, V
@@ -63,6 +71,21 @@ class ModelRunner:
             dtype=dtype,
             device=device,
         )
+
+    def _infer_num_gpu_blocks(self, cfg, dtype, gpu_memory_utilization: float) -> int:
+        """Size the KV cache pool from actual free GPU memory, holding back
+        (1 - gpu_memory_utilization) as headroom for activation memory."""
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        usable_bytes = int(free_bytes * gpu_memory_utilization)
+        bytes_per_block = (
+            2  # K, V
+            * cfg.num_hidden_layers
+            * self.block_size
+            * cfg.num_key_value_heads
+            * cfg.head_dim
+            * torch.empty((), dtype=dtype).element_size()
+        )
+        return usable_bytes // bytes_per_block
 
     def _flat_slot(self, block_table, logical_pos: int) -> int:
         """Physical flat position in self.kv_cache for a request's logical_pos-th token."""
