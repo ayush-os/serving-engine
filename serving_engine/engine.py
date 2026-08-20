@@ -15,14 +15,35 @@ class LLMEngine:
     in scheduler.py and block_manager.py.
     """
 
-    def __init__(self, num_gpu_blocks: int | None = None, model_name: str = None):
+    def __init__(
+        self,
+        num_gpu_blocks: int | None = None,
+        model_name: str = None,
+        max_num_batched_tokens: int | None = None,
+        max_num_seqs: int | None = None,
+    ):
         """num_gpu_blocks=None sizes the KV cache pool from actual free GPU
         memory (see ModelRunner._infer_num_gpu_blocks) instead of a fixed
-        count -- BlockManager is sized to match whatever ModelRunner resolves."""
+        count -- BlockManager is sized to match whatever ModelRunner resolves.
+
+        max_num_batched_tokens/max_num_seqs were built and unit-tested in
+        Scheduler but never threaded through here -- nothing in Phase 1 ran
+        a batch wide enough to need them. They matter now: the eager (not
+        flash) paged-attention op materializes one dense [total_query,
+        total_read] score matrix across the WHOLE scheduled batch, which
+        the fixed startup activation-memory headroom (gpu_memory_utilization
+        in ModelRunner) doesn't account for -- an unbounded batch can OOM at
+        high concurrency even with a correctly-sized KV pool. These caps are
+        the real guard against that until the eager attention op itself
+        gets tiled (a bigger fix, deferred -- see handoff.md)."""
         kwargs = {"model_name": model_name} if model_name else {}
         self.model_runner = ModelRunner(num_gpu_blocks, BLOCK_SIZE, **kwargs)
         self.block_manager = BlockManager(self.model_runner.num_gpu_blocks, BLOCK_SIZE)
-        self.scheduler = Scheduler(self.block_manager)
+        self.scheduler = Scheduler(
+            self.block_manager,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+        )
         self.requests = {}
 
     def add_request(

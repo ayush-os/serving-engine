@@ -213,6 +213,16 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-gpu-blocks", type=int, default=None,
                          help="default: auto-size from real free GPU memory")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2048,
+                         help="bounds total_query in the eager attention op's whole-batch score "
+                              "matrix (see engine.py) -- the fixed startup activation headroom "
+                              "doesn't scale with batch width, so this is the real OOM guard at "
+                              "higher concurrency. Pass 0 to disable (Phase-1-era unbounded behavior).")
+    parser.add_argument("--max-num-seqs", type=int, default=16,
+                         help="bounds total_read (sum of concurrently-running requests' full "
+                              "context lengths) the same way -- decode requests cost only 1 token "
+                              "against --max-num-batched-tokens but still contribute their whole "
+                              "context to the attention op's read side. Pass 0 to disable.")
     parser.add_argument("--no-dmon", action="store_true", help="skip nvidia-smi dmon sampling")
     parser.add_argument("--output", type=str, default="benchmark_results.csv")
     args = parser.parse_args()
@@ -220,10 +230,16 @@ def main():
     rates = [float(r) for r in args.rates.split(",")]
 
     print("Loading model and sizing KV cache pool from free GPU memory...")
-    engine = LLMEngine(num_gpu_blocks=args.num_gpu_blocks)
+    engine = LLMEngine(
+        num_gpu_blocks=args.num_gpu_blocks,
+        max_num_batched_tokens=args.max_num_batched_tokens or None,
+        max_num_seqs=args.max_num_seqs or None,
+    )
     print(
         f"KV cache pool: {engine.model_runner.num_gpu_blocks} blocks "
         f"({engine.block_manager.get_num_free_blocks()} free)\n"
+        f"Scheduler caps: max_num_batched_tokens={engine.scheduler.max_num_batched_tokens}, "
+        f"max_num_seqs={engine.scheduler.max_num_seqs}\n"
     )
 
     tokenizer = engine.model_runner.tokenizer
