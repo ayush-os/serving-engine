@@ -130,10 +130,11 @@ class ModelRunner:
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids_for_model,
-            past_key_values=cache,
+            past_key_values=None,
+            cache=cache,
             read_index=read_idxes_t,
             write_index=write_idxes_t,
-            use_cache=True,
+            use_cache=False,
         )
 
         last_token_logits = {req.request_id: outputs.logits[0, end - 1] for req, _, end in req_spans}
