@@ -16,7 +16,8 @@ class LLMEngine:
     """
 
     def __init__(self, num_gpu_blocks: int, model_name: str = None):
-        self.model_runner = ModelRunner(model_name) if model_name else ModelRunner()
+        kwargs = {"model_name": model_name} if model_name else {}
+        self.model_runner = ModelRunner(num_gpu_blocks, BLOCK_SIZE, **kwargs)
         self.block_manager = BlockManager(num_gpu_blocks, BLOCK_SIZE)
         self.scheduler = Scheduler(self.block_manager)
         self.requests = {}
