@@ -199,77 +199,118 @@ prompt entirely); an off-by-one in the block-table index derived from
 physical block id; decode's read-index off-by-one (`total_len + 1` instead
 of `total_len`, reading a position that was never written).
 
+## Second GPU session — preempt(), the scheduler cap, a real bug, GPU-verified
+
+Both of Phase 1-era's "deferred until Phase 2" items are now done: `preempt()`
+(recompute-based, LIFO eviction, last-resort trigger only — see
+`scheduler.py`'s `schedule()`) and the `max_num_batched_tokens`/`max_num_seqs`
+cap. Both have full pure-Python test coverage (29 tests across
+`test_block_manager.py`/`test_scheduler.py`) and are now GPU-verified too via
+`scripts/preemption_sanity_check.py`.
+
+**Eviction policy, explicitly decided, not the obvious default**: last-resort,
+not eager. The first attempt evicted immediately whenever any single
+candidate couldn't get a block — caught by the pre-existing
+`test_schedule_skips_blocked_decode_without_starving_other_candidates` before
+it ever landed, since it would preempt a request even when the pool would've
+freed up naturally next step. That's not just wasteful, it directly
+contaminates Phase 2's actual measurement (real pool scarcity vs. manufactured
+preemption noise). Fixed to: one normal scheduling pass, then evict-and-retry
+only if `output.scheduled_requests` ends up completely empty — a true stall,
+not just one unlucky candidate.
+
+**A real, previously-undiscovered bug, found by the sanity script and NOT
+specific to preemption**: `can_append_slot`/`append_slot` decided whether to
+grow a request's block table using `total_len % block_size == 0` — a
+shortcut that happens to work for normal incremental single-token decode
+growth (it fires one step early, proactively), but silently assumes the
+table's current capacity followed that exact incremental history.
+`allocate()` doesn't follow that history — it computes
+`ceil(total_len / block_size)` directly, no headroom. Whenever `total_len`
+at admission time is an *exact* multiple of `block_size`, the next decode
+step needs a block that was never provisioned → `IndexError` in
+`ModelRunner._flat_slot`. This isn't preemption-specific — it would hit any
+fresh admission whose prompt length happens to land exactly on a block
+boundary too; three pre-existing tests had `prompt_len == block_size` baked
+in and were asserting the under-sized table as correct, just never having
+gone as far as an actual `forward()` call to surface it. Fixed by checking
+the real invariant directly (`len(block_table) * block_size >= total_len`)
+instead of the modular-arithmetic shortcut.
+
+**GPU confirmation, and it's a stronger signal than "didn't crash"**: the
+sanity script runs 3 requests with an *identical* prompt (so greedy decoding
+makes them decode in lockstep and all three outputs should be identical).
+Only one went through eviction + recompute; the other two decoded
+uninterrupted. All three final outputs came back byte-for-byte identical —
+strong evidence the recompute reconstructed the KV cache correctly, not just
+that it avoided crashing.
+
+**Also found, unrelated to any of the above (environment, not code)**: a
+fresh Paperspace instance resolved `transformers==4.x`/`torch==2.1.1` by
+default, too old for Llama 3.1's `rope_scaling` format and for each other.
+`requirements.txt` now pins `torch>=2.5`/`transformers>=4.43`. Separately,
+installing into that box's shared system Python (pre-loaded with
+`torchaudio`/`torchvision` built against the old `torch`) broke on ABI
+mismatch after upgrading `torch` in place — always use an isolated
+`.venv-gpu` virtualenv, never the system Python, on a fresh box.
+
 ## Deliberately deferred — not bugs, don't "fix" these reflexively
 
-- **`block_manager.py`: `preempt()`** — raises `NotImplementedError`. Not
-  needed for Phase 1's checkpoints (neither correctness-vs-HF nor the
-  continuous-batching demo forces pool exhaustion if `num_gpu_blocks` has
-  headroom). **Hard blocker before Phase 2's load sweep**, though — that's
-  designed to hit exactly this.
 - **`block_manager.py`: `append_slot`'s CoW branch** (marked `# TODO`) —
   needed only once `fork()` is actually exercised by real prefix-sharing,
   which nothing currently triggers (no scheduler-level prefix detection
   exists, and the spec's own scope note says not to chase that beyond what
-  the block manager already gives for free). Genuinely optional, unlike
-  `preempt()`.
-- **`scheduler.py`: `max_num_batched_tokens`/`max_num_seqs` cap** — not
-  enforced. Same status as `preempt()`: fine for Phase 1, must exist before
-  Phase 2's load sweep or an uncapped huge-prefill iteration could
-  contaminate the exact compute-ceiling-vs-KV-pool measurement Phase 2
-  exists to make.
+  the block manager already gives for free). Stays deferred indefinitely.
+- **Starvation avoidance under sustained load** — the last-resort eviction
+  trigger (see "Second GPU session" above) only fires when *nothing at all*
+  progressed this step. A persistently unlucky candidate could in theory
+  wait a long time if something else keeps making unrelated progress every
+  step, since the "nothing progressed" trigger won't refire while anything
+  else is moving. Real fairness needs more machinery (e.g. tracking how
+  long a candidate's been stuck) than this project's scope calls for right
+  now — worth watching for in Phase 2's load sweep, not pre-solving here.
 - **`logits_to_keep` optimization** — `forward()` computes vocab-size
   logits for every prefill token, then discards all but the last one per
   request. Real waste, not a correctness issue. `LlamaForCausalLM.forward()`
   supports `logits_to_keep` to avoid this. Not worth doing until profiling
   (Phase 2) actually shows `lm_head` compute mattering.
 
-## Version risk — check this first on the GPU box
+## Version risk — check this first on a new GPU box
 
 Everything about `attn_implementation="paged|eager"`, `set_attn_implementation`,
 `Cache.update()`'s signature, and `PagedAttentionCache`'s internals was
-verified by reading the **exact source** of whatever `transformers` version
-pip installed locally during this session (**5.15.1**). `requirements.txt`
-currently pins nothing (`transformers` unpinned). If a different version
-lands on the rented GPU box, any of these APIs could have shifted — this
-is a fast-moving part of the library. **Before debugging anything else**,
-confirm the installed version matches, or re-verify the same source
-locations (`cache_utils.py`'s `Cache`/`DynamicCache`, `integrations/eager_paged.py`,
+verified by reading the **exact source** of `transformers==5.15.1`.
+`requirements.txt` now pins `transformers>=4.43`/`torch>=2.5` (see "Second
+GPU session" above), but that floor is for Llama 3.1's `rope_scaling`
+format, not the paged-attention internals — the actual API surface this
+project depends on isn't guaranteed stable across everything `>=4.43`
+allows. **Before debugging anything else on a new box**, confirm the
+resolved version, or re-verify the same source locations
+(`cache_utils.py`'s `Cache`/`DynamicCache`, `integrations/eager_paged.py`,
 `generation/continuous_batching/cache.py`'s `PagedAttentionCache`,
 `modeling_utils.py`'s `ALL_ATTENTION_FUNCTIONS`/`set_attn_implementation`)
-still match what's described above. Consider pinning `transformers==5.15.1`
-in `requirements.txt` to remove this risk entirely, unless there's a reason
-to want newer.
+still match what's described above.
 
-## Immediate next steps — Phase 1 is done, Phase 2 is next
+## Immediate next steps — Phase 2
 
-Phase 1's two checkpoints (correctness, continuous-batching demo) are both
-met — see "Status in one line" above. Phase 2 is the benchmark report
-against `disagg_and_placement_notes.md`'s simulator predictions (spec.md's
-Phase 2 section). Marked 🧠 in spec.md — this phase is meant to be
-judgment-heavy, not just scaffolding: the actual point is a real, checked
-comparison against your own prior prediction, not a demo to build and move
-past.
+Phase 1's two checkpoints (correctness, continuous-batching demo) and both
+Phase-2 prerequisites (`preempt()`, the batching cap) are all done and
+GPU-verified — see "Status in one line" and "Second GPU session" above.
+Phase 2 itself is the benchmark report against
+`disagg_and_placement_notes.md`'s simulator predictions (spec.md's Phase 2
+section). Marked 🧠 in spec.md — this phase is meant to be judgment-heavy,
+not just scaffolding: the actual point is a real, checked comparison
+against your own prior prediction, not a demo to build and move past.
 
-**Required before the load sweep starts** (both currently stubbed, see
-"Deliberately deferred" above — this is exactly the situation they were
-deferred *until*):
-1. **`block_manager.py`'s `preempt()`** — still raises `NotImplementedError`.
-   A real swept-load benchmark will exhaust the block pool; without
-   preemption that's an unhandled crash, not a measurement.
-2. **`scheduler.py`'s `max_num_batched_tokens`/`max_num_seqs` cap** — still
-   unenforced. An uncapped huge-prefill iteration during the sweep would
-   contaminate the exact compute-ceiling-vs-KV-pool measurement Phase 2
-   exists to make.
-
-**Then, per spec.md's Phase 2 section:**
-3. Build a synthetic request generator matching the same distributional
+**Per spec.md's Phase 2 section:**
+1. Build a synthetic request generator matching the same distributional
    assumptions the discrete-event simulator used (`disagg_and_placement_notes.md`
    §4) — Poisson arrivals, a realistic prompt/output-length distribution —
    so results are actually comparable to the simulator's predictions, not a
    different workload shape.
-4. Measure real throughput (req/s), TTFT, per-token decode latency, and GPU
+2. Measure real throughput (req/s), TTFT, per-token decode latency, and GPU
    occupancy under a swept load.
-5. Write the predicted-vs-real comparison: the simulator found prefill's
+3. Write the predicted-vs-real comparison: the simulator found prefill's
    fixed compute ceiling (~4,138 req/s in that setup), not decode capacity
    or the KV pool, was the real bottleneck. Does real hardware confirm that
    shape, or does something the simulator's abstraction missed show up for
@@ -277,8 +318,10 @@ deferred *until*):
    A genuine, checked answer either way is the actual checkpoint —
    disagreement here is a more interesting finding than agreement.
 
-`append_slot`'s CoW branch stays deferred indefinitely — still nothing
-exercises `fork()`/prefix-sharing, unaffected by Phase 2.
+`append_slot`'s CoW branch and starvation avoidance under sustained load
+stay deferred indefinitely (see "Deliberately deferred" above) —
+unaffected by Phase 2, though the latter is worth watching for during the
+load sweep.
 
 ## How this session worked, for continuity
 
