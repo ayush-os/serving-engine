@@ -41,6 +41,7 @@ class Scheduler:
         self.running: List[Request] = []
 
     def add_request(self, request: Request) -> None:
+        self.block_manager.match_prefix(request)
         self.waiting.append(request)
 
     def _select_eviction_victim(self, exclude: Request) -> Request | None:
@@ -178,6 +179,7 @@ class Scheduler:
                 self.running = [r for r in self.running if r is not req]
             elif req.phase == RequestPhase.NEEDS_PREFILL:
                 req.num_computed_tokens += scheduler_output.prefill_chunk_sizes[req.request_id]
+                self.block_manager.register_computed_blocks(req)
                 if req.request_id in scheduler_output.prefill_final_chunk:
                     req.phase = RequestPhase.NEEDS_DECODE
 
