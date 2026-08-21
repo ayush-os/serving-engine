@@ -352,3 +352,26 @@ def test_has_unfinished_requests_false_once_everything_finishes():
     assert sched.has_unfinished_requests()
     sched.update_after_step(output)
     assert not sched.has_unfinished_requests()
+
+
+def test_shared_prefix_second_request_skips_prefill_compute():
+    """The actual point of prefix caching, not just block reuse: a second
+    request whose whole prompt matches an already-cached first request's
+    prompt should be admitted with zero prefill compute cost this step."""
+    sched = make_scheduler(num_gpu_blocks=10, block_size=4)
+    req_a = make_request("a", prompt_len=4)
+    sched.add_request(req_a)
+    output_a = sched.schedule()
+    sched.update_after_step(output_a)  # registers block 0's hash
+
+    req_b = make_request("b", prompt_len=4)  # identical content (range(4))
+    sched.add_request(req_b)  # match_prefix finds req_a's cached block
+    assert req_b.num_computed_tokens == 4  # matched before schedule() ever runs
+    assert req_b.block_table == req_a.block_table
+
+    output_b = sched.schedule()
+
+    assert req_b in output_b.scheduled_requests
+    assert output_b.prefill_chunk_sizes[req_b.request_id] == 0
+    assert req_b.request_id in output_b.prefill_final_chunk
+    assert sched.block_manager.blocks[req_a.block_table[0]].ref_count == 2
