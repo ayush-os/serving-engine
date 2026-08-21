@@ -230,14 +230,36 @@ Phase 2" for the full reasoning across time cost, learning/time ratio, and
 company fit. This spec was never meant to be followed past the point real
 data disagrees with its own priorities.
 
+**Real data landed** (see `handoff.md`'s "Fourth GPU session" for the full
+story): the "chunking flattens the TTFT-vs-load curve" hypothesis above
+was wrong, and the real result is narrower and more specific — chunking
+fixed a real tail-latency pathology pre-saturation (`ttft_p99_ms` down
+14-20% at unsaturated rates, a genuine all-or-nothing admission bug it
+removed) but left the saturation ceiling itself untouched (`ttft_mean_ms`
+and throughput statistically unchanged at rate≥4), because at saturation
+TTFT is dominated by admission-queue depth (`max_num_seqs`), a resource
+chunking never touches. That's a more useful result than a clean "yes it
+flattened," not a less useful one — it pins the saturation bottleneck down
+to something Phase 4 can plausibly fix and chunking structurally can't,
+directly motivating Phase 4's priority below. Correctness: GPU-verified,
+chunked-vs-one-shot match modulo the same bf16-noise signature Phase 1's
+own HF-comparison xfail already established as expected, not chased
+further (same discipline, see `handoff.md`'s "First GPU session").
+
 ---
 
-## Phase 3 — Stretch: real tensor parallelism for a model that doesn't fit on one GPU (🧠, first-priority stretch, subject to the post-Phase-2 triage)
+## Phase 3 — Stretch: real tensor parallelism for a model that doesn't fit on one GPU (🧠, re-ranked below Phase 4 post-triage — see note)
 
 Entry into this phase (and its priority relative to Phase 4/5) is decided
 at the Decision 3 triage checkpoint, not fixed in advance — this section
-describes what the work looks like *if* triage selects it, given it's
-named as the likely first pick.
+describes what the work looks like *if* triage selects it. It was named
+as the likely first pick before that checkpoint actually ran; the triage
+(see `handoff.md`'s "Roadmap after Phase 2") re-ranked Phase 4 above this
+one instead — most expensive stretch phase (multi-GPU rental, distributed
+correctness debugging) with the lowest incremental learning ratio given
+existing real ZeRO/FSDP/DDP experience, and real finish-risk if it's
+attempted with limited time remaining. Still real, still valuable, just
+not next.
 
 Extend the engine to serve Decision 1's named TP target (e.g. Llama-3-70B
 at TP=4 or TP=8) by building real column/row-parallel sharded linear
@@ -271,7 +293,7 @@ what Anthropic/OpenAI-scale inference actually requires.
 
 ---
 
-## Phase 4 — Stretch: a real paged-attention kernel (🧠, optional, kernels×systems crossover)
+## Phase 4 — Now the top-priority stretch: a real paged-attention kernel (🧠, re-ranked above Phase 3 post-triage — see note)
 
 Replace the gather-then-dense MVP attention path with a real block-sparse
 kernel that reads directly from non-contiguous cache blocks — extend your
@@ -280,8 +302,29 @@ gather-index inside the kernel, rather than gathering into a contiguous
 buffer beforehand. Measure the real speedup (or lack thereof) over the
 Phase 1 MVP path — a real number, not assumed.
 
-Explicitly optional. Skip if Phase 1-2 eat more of the time budget than
-planned — the project is complete without it (see Fallback).
+Originally written as optional/lower-priority; re-ranked to the top
+stretch pick after Phase 2.5's real data landed (see `handoff.md`'s
+"Fourth GPU session" and Phase 2.5's "Real data landed" note above), for
+a concrete reason, not just general kernel-work appeal: Phase 2.5 pinned
+the saturation-latency bottleneck down to admission-queue depth
+(`max_num_seqs`), which exists as a defensive cap against the eager
+attention op's unbounded, batch-composition-dependent memory scaling
+(the same mechanism behind Phase 2's own real OOM bugs). A tiled kernel
+that never materializes the full attention matrix has a small, predictable
+memory footprint regardless of batch composition — the plausible, direct
+fix for the exact resource Phase 2.5 showed governs TTFT at saturation.
+The real measurement checkpoint is correspondingly more specific now:
+does raising `max_num_seqs` post-kernel actually reduce TTFT at
+saturation in a rerun of `scripts/benchmark_load.py`, not just "is the
+kernel faster in isolation." See `handoff.md`'s "Immediate next steps —
+Phase 4" for the full design-fork list.
+
+Given this is likely the last phase attempted (per the user, see
+`handoff.md`), its bounded scope and reuse of existing kernel work also
+make it the lower-risk pick over Phase 3/5 specifically because it's more
+likely to finish cleanly — spec.md's own Fallback logic already says a
+complete phase beats a half-built one, which matters more with no next
+phase to fall back to.
 
 ---
 
@@ -331,24 +374,33 @@ Phase 2 (real benchmarking vs. your own simulator's predictions) is the
 natural close-the-loop addition and the strongest interview story — and
 is now data-complete (see Phase 2's "Real data landed" note above).
 
-**Stretch priority, re-ranked after Phase 2's real data came in** (see
-`handoff.md`'s "Roadmap after Phase 2" for the full reasoning across time
-cost, learning/time ratio, novelty vs. skills already demonstrated
-elsewhere in the portfolio, and target-company fit): **Phase 2.5
-(chunked prefill)** first — cheapest, highest learning ratio, and closes a
-gap Phase 2's own numbers exposed, not a speculative one. **Phase 4 (real
-paged-attention kernel)** second — same motivation (fixes the eager-
-attention memory-scaling problem Phase 2's GPU runs actually hit),
-extends an existing skill into a genuinely different technique rather
-than composing one already banked. **Phase 3 (real tensor parallelism)**
-third — still valuable, the most direct "Anthropic/OpenAI-scale
-inference" story, but the most expensive and the lowest incremental
-learning ratio given existing real ZeRO/FSDP/DDP experience. **Phase 5
-(real disaggregation)** last — highest novelty and the most direct
-predict-then-validate story in this repo, but also the highest time cost;
-only chase with real time to spare.
+**Stretch priority, re-ranked after Phase 2's real data came in, then
+again after Phase 2.5's** (see `handoff.md`'s "Roadmap after Phase 2" for
+the full reasoning across time cost, learning/time ratio, novelty vs.
+skills already demonstrated elsewhere in the portfolio, and target-company
+fit): ~~**Phase 2.5 (chunked prefill)** first~~ — **done**, see Phase
+2.5's "Real data landed" note above and `handoff.md`'s "Fourth GPU
+session." **Phase 4 (real paged-attention kernel)** is now the top
+priority — more directly motivated than before, since Phase 2.5's own
+data pinned the saturation-latency bottleneck down to admission-queue
+depth (`max_num_seqs`), a resource a tiled kernel could plausibly free up
+and chunking structurally can't touch (see Phase 4's section above).
+**Phase 3 (real tensor parallelism)** still third — still valuable, the
+most direct "Anthropic/OpenAI-scale inference" story, but the most
+expensive and the lowest incremental learning ratio given existing real
+ZeRO/FSDP/DDP experience, and (per the user, since Phase 4 is likely the
+last phase attempted) the real finish-risk of a multi-GPU/distributed
+debugging phase matters more now with no next phase to fall back to.
+**Prefix-sharing / finishing `fork()`** is the one candidate for a fast
+second phase after Phase 4 if time allows — real and bounded, though
+partially pre-empted by an existing derivation elsewhere in the
+portfolio (lower marginal learning value) — TP and disaggregation are
+each standalone undertakings with their own finish-risk, not bonus-slot
+material. **Phase 5 (real disaggregation)** last — highest novelty and
+the most direct predict-then-validate story in this repo, but also the
+highest time cost; only chase with real time to spare.
 
 If time runs out partway through the stretch phases, stop after whichever
 one just finished cleanly rather than leaving one half-done — a complete
-Phase 2.5 is worth more than a half-built Phase 5, same logic as before,
-just re-pointed at the new ordering.
+Phase 4 is worth more than a half-built Phase 3 or 5, same logic as
+before, just re-pointed at the new ordering.
