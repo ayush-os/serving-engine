@@ -176,11 +176,17 @@ def test_prefix_cache_matches_uncached():
 
     cached_engine = LLMEngine(num_gpu_blocks=1024)
     try:
-        # Warmup runs to completion first, registering its blocks -- then
-        # the real request should match_prefix onto them at admission.
-        cached_engine.add_request(SHARED_PROMPT, max_new_tokens=1)
-        while cached_engine.scheduler.has_unfinished_requests():
-            cached_engine.step()
+        # Sharing only works between concurrently-alive requests here --
+        # free() hard-releases AND invalidates a block's hash the instant
+        # ref_count hits 0 (correctly: that physical block is about to be
+        # handed to an unrelated future allocation), so there's no
+        # retention window after a request actually finishes. The warmup
+        # must still be alive (mid-decode) when the real request arrives,
+        # not run to completion first -- max_new_tokens=5 so one step()
+        # (which completes its single-chunk prefill) leaves it in
+        # NEEDS_DECODE, not FINISHED.
+        cached_engine.add_request(SHARED_PROMPT, max_new_tokens=5)
+        cached_engine.step()
 
         real_id = cached_engine.add_request(SHARED_PROMPT, max_new_tokens=MAX_NEW_TOKENS)
         real_request = cached_engine.requests[real_id]
