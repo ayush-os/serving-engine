@@ -140,3 +140,51 @@ def test_chunked_prefill_matches_one_shot(prompt):
         torch.cuda.empty_cache()
 
     assert actual == expected
+
+
+def test_prefix_cache_matches_uncached():
+    """Prefix-caching checkpoint: a request whose prefix gets served from
+    another already-completed request's cached blocks must produce
+    identical output to the same request run with nothing to match onto.
+    Compared against this engine's own uncached path on the identical
+    prompt, same methodology as test_chunked_prefill_matches_one_shot above.
+
+    Unlike chunking, there's no a priori reason to expect bf16 divergence
+    here: the "cached" path's shared blocks are literally the same physical
+    bytes produced by the warmup request's own solo prefill forward() call
+    -- structurally identical batch composition to the uncached path's own
+    solo call, not a differently-shaped/batched one. If this ever does
+    fail, use the same first-diverging-token logit diagnostic as the
+    existing xfails above before assuming it's a real bug.
+    """
+    SHARED_PROMPT = "In machine learning, a transformer is"  # long enough to clear one full 16-token block
+
+    uncached_engine = LLMEngine(num_gpu_blocks=1024)
+    try:
+        [expected] = uncached_engine.generate([SHARED_PROMPT], max_new_tokens=MAX_NEW_TOKENS)
+    finally:
+        del uncached_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    cached_engine = LLMEngine(num_gpu_blocks=1024)
+    try:
+        # Warmup runs to completion first, registering its blocks -- then
+        # the real request should match_prefix onto them at admission.
+        cached_engine.add_request(SHARED_PROMPT, max_new_tokens=1)
+        while cached_engine.scheduler.has_unfinished_requests():
+            cached_engine.step()
+
+        real_id = cached_engine.add_request(SHARED_PROMPT, max_new_tokens=MAX_NEW_TOKENS)
+        real_request = cached_engine.requests[real_id]
+        assert real_request.num_computed_tokens > 0, "prefix match didn't fire -- test proves nothing"
+
+        while cached_engine.scheduler.has_unfinished_requests():
+            cached_engine.step()
+        actual = cached_engine.model_runner.tokenizer.decode(real_request.output_token_ids)
+    finally:
+        del cached_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    assert actual == expected
