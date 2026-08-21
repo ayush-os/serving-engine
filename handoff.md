@@ -1,26 +1,31 @@
-# Handoff — serving-engine, Phase 1 complete, starting Phase 2
+# Handoff — serving-engine, Phase 1+2 complete, starting Phase 2.5 (chunked prefill)
 
 Written so a fresh chat session (or future you) can pick up exactly where
 this one left off, without re-deriving anything already settled. Read
 `spec.md` first for the project's overall shape (phases, decisions,
 scope) — this doc covers everything *since* Phase 0 that spec.md doesn't
-capture: real implementation decisions, bugs found and fixed, and what's
-actually left before Phase 2 is checkpointed.
+capture: real implementation decisions, bugs found and fixed, real
+benchmark data, and what's actually left before Phase 2.5 is checkpointed.
 
-**Repo:** https://github.com/ayush-os/serving-engine (public), 44+ commits on
+**Repo:** https://github.com/ayush-os/serving-engine (public), 52+ commits on
 `main` as of this doc — check `git log` for the current count, it'll be
 stale immediately.
 
 ## Status in one line
 
-**Phase 1 is fully checkpointed.** `test_correctness.py` passes (2 exact
-matches, 1 `xfail` for expected bf16 drift — see "First GPU session"
-below). `scripts/continuous_batching_demo.py` demonstrates staggered
-arrivals folding into an already-running batch (observed in the per-step
-timeline, not assumed) and measures a 1.71x wall-time speedup over a
-naive-sequential baseline on a 3-request run, with sustained non-zero
-`nvidia-smi dmon` SM utilization throughout. Phase 2 is next — see
-"Immediate next steps" at the bottom, now pointed at Phase 2 instead.
+**Phase 1 and Phase 2 are both fully checkpointed.** Phase 1:
+`test_correctness.py` passes (2 exact matches, 1 `xfail` for expected bf16
+drift), `scripts/continuous_batching_demo.py` shows a 1.71x speedup with
+sustained GPU utilization (see "First GPU session"), `preempt()`/eviction
+GPU-verified (see "Second GPU session"). Phase 2: a real load sweep ran
+end-to-end on real hardware (`scripts/benchmark_load.py`), found and fixed
+three real bugs along the way, and produced a genuine predicted-vs-real
+read against `disagg_and_placement_notes.md`'s Finding 3 — see "Third GPU
+session" below for the full story, findings, and what does/doesn't
+generalize from them. **Phase 2.5 (chunked prefill) is next** — not a
+phase spec.md originally specified, added because Phase 2's own data
+motivated it directly. See "Roadmap after Phase 2" and "Immediate next
+steps" at the bottom.
 
 ## First GPU session — model swap, real bugs found, correctness result
 
@@ -103,17 +108,34 @@ Rented an A100 (~40GB variant). Three real things happened, in order:
 serving_engine/
   block.py           BLOCK_SIZE=16, Block dataclass — done, no known issues.
   request.py         Request/RequestPhase/RequestStatus — done.
+                      num_computed_tokens field exists, reset on preempt(),
+                      but not currently incremented/read anywhere else --
+                      see "Immediate next steps" below, this is the field
+                      chunked prefill needs to track partial progress.
   block_manager.py   allocate/append_slot/free/fork/preempt all done, GPU-
-                      verified. Only append_slot's CoW branch still stubbed
+                      verified. append_slot's CoW branch still stubbed
                       (deliberately, see "Deliberately deferred" below).
   scheduler.py        schedule()/update_after_step() done, GPU-verified.
                       Last-resort LIFO eviction + max_num_batched_tokens/
-                      max_num_seqs cap both implemented and enforced.
+                      max_num_seqs cap both implemented, enforced, and
+                      GPU-verified under real load (Third GPU session --
+                      includes a real starvation-bug fix, see below).
   model_runner.py     ModelRunner + _PagedKVCache + forward() — fully
                       written, GPU-verified (correctness + preemption
-                      recompute both confirmed). No known issues.
+                      recompute both confirmed). Known real limitation:
+                      eager (non-tiled) attention's transient memory
+                      scales with batch composition -- see "Third GPU
+                      session" and Phase 4 in spec.md.
   engine.py           LLMEngine wiring — done, GPU-verified end-to-end
-                      (generate(), step(), num_gpu_blocks=None auto-sizing).
+                      (generate(), step(), num_gpu_blocks=None auto-sizing,
+                      max_num_batched_tokens/max_num_seqs pass-through).
+                      step() early-returns if scheduled_requests comes
+                      back empty (defensive guard added Third GPU session).
+                      add_request() also accepts prompt_token_ids/ignore_eos
+                      for benchmarking (bypasses the tokenizer/EOS for
+                      synthetic load).
+  workload.py         Synthetic Poisson/lognormal request generator for
+                      Phase 2 -- pure Python, unit-tested, no GPU needed.
 scripts/
   continuous_batching_demo.py    Phase 1's 2nd checkpoint: staggered
                       arrivals + naive-vs-continuous speedup comparison.
@@ -121,12 +143,28 @@ scripts/
   preemption_sanity_check.py     GPU sanity check for preempt()/eviction --
                       forces a real eviction deterministically, asserts it
                       fired, checks outputs are coherent post-recompute.
+  benchmark_load.py   Phase 2's measurement harness: sweeps a synthetic
+                      Poisson workload across offered rates, measures
+                      throughput/TTFT/decode-latency/prefill-step-time/GPU
+                      occupancy, writes a CSV. See "Third GPU session" for
+                      how this actually ran and what it found.
 tests/
   test_block_manager.py   11 tests, pure Python, no torch/GPU — passing.
-  test_scheduler.py        18 tests, pure Python, no torch/GPU — passing.
+  test_scheduler.py        19 tests, pure Python, no torch/GPU — passing.
+                      Includes a regression test for the Third-GPU-session
+                      starvation bug.
   test_correctness.py       Phase 1's checkpoint (token-for-token vs HF
                       .generate()) — GPU-verified, 2 pass exactly, 1 xfail
                       (confirmed bf16 drift, not a bug -- see below).
+  test_workload.py          9 tests, pure Python -- Poisson/lognormal
+                      distribution sanity, length-cap clamping.
+benchmark_results.csv, benchmark_results_80gb.csv, benchmark_results_final.csv
+                      Real Phase 2 sweep output, committed to the repo root
+                      (not results/ -- kept flat, matches how the rest of
+                      this repo doesn't nest single-purpose output files).
+                      _final has the prefill/decode/mixed step-time split;
+                      the other two predate that instrumentation. See
+                      "Third GPU session" for what's actually in them.
 .venv/                 local venv for the pure-Python test files only
                       (no torch). NOT what runs on the GPU box.
 ```
@@ -138,7 +176,9 @@ below for why (ABI conflicts with pre-loaded packages on a fresh box).
 ## The real story of `model_runner.forward()` — why it looks the way it does
 
 This is the part most worth understanding before touching it again, since
-it went through a real pivot mid-build.
+it went through a real pivot mid-build. (Its real memory-scaling behavior
+under load is a separate, later story — see "Third GPU session" below and
+Phase 4 in spec.md; this section is about correctness/mechanism, not cost.)
 
 **Original plan (abandoned):** gather each request's cached K/V from its
 `block_table` into a dense per-request buffer, wrap it in a `DynamicCache`,
@@ -192,12 +232,17 @@ where the real bugs were:
   the "empty read_index" shortcut real paged implementations use only
   applies when the *whole batch* is pure prefill with nothing to read
   anywhere, which isn't this engine's case since prefill/decode are
-  deliberately mixed).
+  deliberately mixed). **This is the field chunked prefill will need to
+  change**: today prefill always contributes its *entire* prompt as one
+  block of write/read positions in a single call (`req.all_token_ids()`,
+  `range(req.total_len)`) — see "Immediate next steps."
 - `attention_mask`: `[1,1,total_query,total_read]`, built from two
   broadcast comparisons over per-token (request-group, logical-position)
   pairs — same request AND key position ≤ query position. Uses
   `torch.finfo(dtype).min`, not literal `-inf` (avoids NaN-from-fully-masked
-  softmax rows, matching HF's own convention).
+  softmax rows, matching HF's own convention). **This is one dense matrix
+  over the whole scheduled batch, not tiled** — the real mechanism behind
+  the Third GPU session's OOMs, see below.
 - `position_ids`: each token's position *within its own request*, not its
   index in the flattened batch — required because RoPE's relative-distance
   property only holds if positions are each token's true sequence position;
@@ -266,26 +311,207 @@ installing into that box's shared system Python (pre-loaded with
 mismatch after upgrading `torch` in place — always use an isolated
 `.venv-gpu` virtualenv, never the system Python, on a fresh box.
 
+## Third GPU session — Phase 2 load sweep: three real bugs, then real findings
+
+This was a long, iterative session: build the harness, hit a real bug on
+the GPU, fix it, hit the *next* real bug, fix it, and so on, until a clean
+sweep finally ran. Every one of these was a genuine bug caught by real
+load — none of it was visible from pure-Python unit tests or from Phase 1's
+light-load demos, which is exactly why Phase 2's actual load sweep was
+worth building rather than declaring Phase 1's demo "good enough" evidence
+of a working scheduler under real concurrency.
+
+### Bug 1 — eager attention has no memory ceiling of its own
+
+First sweep OOM'd at rate=1.0 req/s (fine at 0.5). `model_runner.forward()`'s
+attention op (`eager_paged_attention_forward`) builds **one dense
+`[total_query, total_read]` score matrix across the whole scheduled batch**
+— not tiled like FlashAttention. `ModelRunner._infer_num_gpu_blocks`
+reserves activation headroom as a fixed 10% of free-memory-after-weights,
+computed once at startup, with no idea how wide a real batch gets. More
+concurrent requests at rate=1.0 than at rate=0.5 pushed the score matrix
+past that fixed headroom.
+
+Fix: `Scheduler` already had `max_num_batched_tokens`/`max_num_seqs` caps
+(built and unit-tested in the second GPU session) but `LLMEngine` never
+passed them through — nothing in Phase 1 ran a batch wide enough to need
+them. Wired them into `LLMEngine.__init__` (commit `d3cde62`).
+
+### Bug 2 — a candidate over the token cap alone could starve forever
+
+Wiring in the caps immediately exposed a real, previously-latent
+`scheduler.py` bug: `schedule()`'s token-budget check
+(`num_batched_tokens + cost > max_num_batched_tokens`) applied even at
+`num_batched_tokens == 0`, so a single waiting prefill whose own cost
+exceeded the cap could **never** be scheduled — not now, not ever, no
+matter how idle the system was. It's a `NEEDS_PREFILL` candidate, so it
+never reaches `blocked_decode_candidates` either, meaning nothing could
+unstick it: permanent starvation, silently returning an empty
+`scheduled_requests` forever. That empty batch is what actually crashed
+things downstream: `torch.tensor([])` on the empty token list defaults to
+float32, and `embed_tokens` wanted Long/Int.
+
+Fix, decided explicitly (not the obvious "just raise the cap" workaround):
+the token-budget check now only limits piling more work on top of
+something *already* batched this step — a lone candidate always gets
+admitted regardless of its own cost (commit `2ab9de5`). This is the
+standard convention absent chunked prefill (which doesn't exist yet — see
+"Immediate next steps"). An existing test that used a zero-budget lone
+candidate as a test device for "cap-blocked, not resource-stalled" had to
+be rewritten with two candidates, since a lone one is now always admitted.
+Also added a defensive early-return in `engine.step()` for any other
+empty-batch case (e.g. a block-capacity stall with no eviction victim
+available) — `forward()` has no real batch to run in that case either.
+
+### Bug 3 — width-bounded caps weren't depth-bounded
+
+Caps in place, sweep OOM'd again at rate=1.0. Root cause: `max_num_seqs`
+bounds how many requests run concurrently, but each one still contributes
+its **entire** context length to the attention read side — nothing bounded
+how long any single admitted request's context could grow. ~15 concurrent
+long-tail decode contexts plus one more admitted prefill (all within
+`max_num_seqs=16`/`max_num_batched_tokens=2048`) pushed the score matrix to
+~5GB against a ~2.5GB headroom.
+
+Fix: clamp the workload generator's lognormal prompt/output tail directly
+(`workload.py`'s `max_prompt_len`/`max_output_len`, commit `3cf43be`) —
+this turned out to be the historically-correct fix too, not just
+expedient: it matches `disagg_and_placement_notes.md` §3's own "hard stop,
+not compaction" admission policy. Combined with tighter scheduler defaults
+(1024 tokens / 8 seqs), worst-case score matrix came out to ~650MB.
+
+### Environment note — CUDA driver mismatch on a fresh box (unresolved)
+
+A later fresh Paperspace box (different from the ones above) hit
+`RuntimeError: The NVIDIA driver on your system is too old (found version
+12020)` — `pip install torch` grabbed a CUDA build newer than that box's
+driver supported. Proposed fix, **never actually confirmed working** (the
+session moved to a different, larger box instead of retrying on this one):
+`pip uninstall -y torch torchvision torchaudio && pip install "torch>=2.5"
+--index-url https://download.pytorch.org/whl/cu121`. cu121 should be the
+safer default across arbitrary rented boxes generally (drivers are
+backward-compatible with older CUDA runtime builds, never forward-
+compatible), but verify this actually works before trusting it blindly on
+a new box.
+
+### The OOMs were actually the 40GB A100, not a scaling flaw
+
+Both real OOMs above happened on a 40GB A100. Switching to an 80GB card
+cleared the *same* workload without needing the tight caps — and doubling
+every cap back up (`max_num_seqs` 8→16, `max_prompt_len` 1024→2048,
+`max_output_len` 256→512) barely moved the measured throughput ceiling at
+all (~2.1 req/s either way, SM util within ~1-2pp). That's a real, useful
+confirmation: the ceiling found below isn't a scheduler-cap artifact, it's
+a genuine hardware/compute ceiling.
+
+### The actual Phase 2 findings — real hardware vs. `disagg_and_placement_notes.md`'s Finding 3
+
+Final config: `max_num_seqs=16`, `max_num_batched_tokens=1024`,
+`max_prompt_len=2048`, `max_output_len=512`. Results in
+`benchmark_results_final.csv` (has the prefill/decode/mixed step-time
+split; `benchmark_results.csv`/`benchmark_results_80gb.csv` are earlier
+sweeps without that instrumentation, kept for the cap-sensitivity
+comparison above).
+
+- **Throughput plateaus hard**: flat ~2.0–2.17 req/s from offered
+  rate=4 through rate=32 — 8x more offered load, ~0% more completed.
+- **TTFT grows unboundedly** past that same point: ~150ms → 143 *seconds*
+  at rate=32.
+- **Decode stays cheap and nearly flat**: 24→30ms, ~25% growth across a
+  64x load increase — never the bottleneck, in this configuration (see
+  "what generalizes" below — this is a conditional finding, not universal).
+- **Directly measured, not inferred** (added specifically to nail this
+  down, not just argue it from decode staying cheap): prefill-involving
+  steps are only ~8% of step count at saturation but consume ~33–35% of
+  wall-clock time (`pct_wall_time_prefill_or_mixed`), because each one
+  costs ~7x a decode step. `prefill_step_time_mean_ms` itself plateaus
+  (~215–227ms) once `max_num_batched_tokens` saturates — a literal
+  fixed-cost-per-max-batch ceiling.
+- **SM utilization saturates ~89–90%, never 100%** — a real ~10-11% gap,
+  possibly genuine per-step CPU-side overhead: `model_runner.forward()`
+  builds `write_idxes`/`read_idxes`/`position_ids`/the attention mask as
+  synchronous Python-list work before every single GPU call. Not confirmed
+  as the cause, just a plausible, honest candidate — the kind of thing
+  spec.md's own Phase 2 checkpoint asked to watch for ("kernel launch
+  overhead, scheduling overhead").
+- **Net**: real hardware confirms the simulator's qualitative *shape* —
+  a fixed compute ceiling, decode not the bottleneck in this configuration,
+  unbounded queueing delay past the ceiling. Absolute numbers aren't
+  comparable (1 A100/8B/bf16 here vs. a 29-machine TPU-8i/70B/FP4 pool in
+  the simulator) — no valid unit conversion between them, only the
+  mechanism transfers.
+
+### What generalizes from this, and what doesn't — worth getting right in any future writeup
+
+Explicitly worked through this with the user; don't flatten it back into
+"decode is cheap" as a universal claim in any future report.
+
+**Fully general (queueing theory, not LLM-specific)**: throughput
+plateaus and wait time grows unboundedly once offered load exceeds
+whatever the system's real service capacity is — true of any finite-
+service-rate system, regardless of what's actually saturating.
+
+**General as a mechanism, now confirmed with real hardware (not just the
+simulator)**:
+- Once a system is past its own compute-bound crossover, more
+  concurrency/memory headroom stops buying throughput — this session's own
+  cap-doubling experiment (8→16 seqs, depth 2x, ceiling barely moved) is
+  real-hardware confirmation of the same asymptote
+  `disagg_and_placement_notes.md` hit independently four times
+  analytically.
+- A hard per-iteration admission budget needs an explicit "always let the
+  lone candidate through" guarantee or it can starve indefinitely (Bug 2
+  above) — general scheduling-theory point, not LLM-specific.
+- Untiled/eager attention has batch-composition-dependent transient
+  memory, which breaks any fixed-fraction memory reservation sized at
+  startup (Bugs 1 and 3) — generalizes to any engine built this way,
+  explicitly does NOT hold for real production engines using
+  FlashAttention-style tiling, which is exactly the gap between this
+  implementation and what `disagg_and_placement_notes.md` §3.7 assumed.
+- A resource can dominate wall-clock time while being a small minority by
+  operation count, if its per-operation cost is disproportionate (the
+  8%-of-steps/33%-of-time finding) — general cost-share-vs-frequency
+  reasoning; the specific numbers are this run's, the principle isn't.
+
+**The meta-finding (the generalizable version of "decode isn't the
+bottleneck")**: there is no universal prefill-vs-decode bottleneck
+ordering. Which one dominates is determined by workload shape
+(input/output length ratio — this run used DistServe's prefill-heavy
+512/64 average) and how much concurrency the system actually permits
+(`max_num_seqs=16` here, itself an artifact of this engine's untiled
+attention, not a fundamental serving constraint). Both are levers, not
+constants. A decode-heavy workload (long generations, short prompts) or a
+system permitting much higher decode concurrency (e.g. a tiled-attention
+engine) could flip which phase dominates. *That conditional structure* is
+the portable claim — "prefill dominates" is just where the levers landed
+here.
+
 ## Deliberately deferred — not bugs, don't "fix" these reflexively
 
 - **`block_manager.py`: `append_slot`'s CoW branch** (marked `# TODO`) —
   needed only once `fork()` is actually exercised by real prefix-sharing,
   which nothing currently triggers (no scheduler-level prefix detection
-  exists, and the spec's own scope note says not to chase that beyond what
-  the block manager already gives for free). Stays deferred indefinitely.
+  exists). No longer "deferred indefinitely" with no plan — it's now a
+  real (if low-priority) roadmap candidate, see "Roadmap after Phase 2"
+  below. Confirmed via `grep` this session: `fork()` is only ever called
+  from `tests/test_block_manager.py`, never from `scheduler.py`/`engine.py`.
 - **Starvation avoidance under sustained load** — the last-resort eviction
   trigger (see "Second GPU session" above) only fires when *nothing at all*
   progressed this step. A persistently unlucky candidate could in theory
   wait a long time if something else keeps making unrelated progress every
   step, since the "nothing progressed" trigger won't refire while anything
-  else is moving. Real fairness needs more machinery (e.g. tracking how
-  long a candidate's been stuck) than this project's scope calls for right
-  now — worth watching for in Phase 2's load sweep, not pre-solving here.
+  else is moving. This is a different mechanism from the Third-GPU-session
+  starvation bug (that one was a hard, permanent block; this one is a soft
+  fairness gap) — real fairness needs more machinery (e.g. tracking how
+  long a candidate's been stuck) than this project's scope calls for. Not
+  specifically probed during Phase 2's load sweep — still an open,
+  correctly-flagged gap, not a "checked, doesn't happen" one.
 - **`logits_to_keep` optimization** — `forward()` computes vocab-size
   logits for every prefill token, then discards all but the last one per
   request. Real waste, not a correctness issue. `LlamaForCausalLM.forward()`
-  supports `logits_to_keep` to avoid this. Not worth doing until profiling
-  (Phase 2) actually shows `lm_head` compute mattering.
+  supports `logits_to_keep` to avoid this. Still not worth doing on its
+  own — but chunked prefill's own per-chunk logits handling will likely
+  touch this same code path, worth revisiting together, not in isolation.
 
 ## Version risk — check this first on a new GPU box
 
@@ -301,59 +527,134 @@ resolved version, or re-verify the same source locations
 (`cache_utils.py`'s `Cache`/`DynamicCache`, `integrations/eager_paged.py`,
 `generation/continuous_batching/cache.py`'s `PagedAttentionCache`,
 `modeling_utils.py`'s `ALL_ATTENTION_FUNCTIONS`/`set_attn_implementation`)
-still match what's described above.
+still match what's described above. **Also check the CUDA driver version**
+before assuming a fresh box's default `pip install torch` will just work —
+see the Third GPU session's "Environment note" above, unresolved.
 
-## Immediate next steps — Phase 2
+## Roadmap after Phase 2 — ranked, with reasoning, not just a list
 
-Phase 1's two checkpoints (correctness, continuous-batching demo) and both
-Phase-2 prerequisites (`preempt()`, the batching cap) are all done and
-GPU-verified — see "Status in one line" and "Second GPU session" above.
-Phase 2 itself is the benchmark report against
-`disagg_and_placement_notes.md`'s simulator predictions (spec.md's Phase 2
-section). Marked 🧠 in spec.md — this phase is meant to be judgment-heavy,
-not just scaffolding: the actual point is a real, checked comparison
-against your own prior prediction, not a demo to build and move past.
+spec.md was a starting point, explicitly not treated as binding once real
+data disagreed with its priorities (same discipline as the bf16-drift
+decision in the first GPU session). Scoped out Phases 3-5 plus
+alternatives across four axes: time cost, learning/time ratio, novelty vs.
+skills already demonstrated elsewhere in the portfolio, and fit to target
+companies (MatX #1; Etched and OpenAI tied #2 — see the `portfolio-
+roadmap` memory for the full company/role context if a fresh session needs
+it, not duplicated in full here).
 
-**`disagg_and_placement_notes.md` is NOT in this repo** — it's Phase 0 work
-that lives elsewhere (the user has it). Needed before step 1 can start for
-real; don't guess at its distributional assumptions or the ~4,138 req/s
-figure below beyond what's already written down here.
+1. **Chunked prefill** (not an original spec.md phase — see spec.md's new
+   Phase 2.5) — top priority. Directly closes the gap Phase 2's own data
+   exposed (prefill dominates wall time, TTFT explodes at saturation)
+   rather than a speculative one. Bounded scope (`scheduler.py`-level,
+   comparable to `preempt()`'s size). Genuinely new mechanism, not
+   composing an already-🟢 skill. Best self-contained predict→build→
+   validate loop available right now, since the "problem" half is already
+   measured in `benchmark_results_final.csv`.
+2. **Phase 4 (real paged-attention kernel)** — also directly motivated by
+   this session: fixes the actual eager-attention memory-scaling problem
+   behind Bugs 1 and 3 above. Extends the existing Triton FlashAttention-2
+   kernel (not from scratch — spec.md's Decision 3 explicitly guards
+   against re-proving kernel-writing ability) into a genuinely different
+   technique (block-sparse gather-index vs. dense). Strong fit for the
+   Kernel/ML Performance Engineer secondary target and MatX's
+   accelerator-codesign focus.
+3. **Phase 3 (real tensor parallelism)** — spec.md's own first-priority
+   stretch, most direct "Anthropic/OpenAI-scale inference" story, but the
+   most expensive (multi-GPU rental, distributed correctness debugging)
+   and the lowest incremental learning ratio here — real prior from-
+   scratch ZeRO/FSDP/DDP experience already exists, and inference-time
+   TP's core mechanism (sharded matmul + collectives) is conceptually
+   adjacent, even though the inference-specific KV-cache-across-ranks
+   details are genuinely new. Still worth doing eventually for the
+   OpenAI/Anthropic-fit value.
+4. **Prefix-sharing / finishing `fork()`** — real and bounded (ref-
+   counting already exists, needs scheduler-level prefix detection at
+   admission time), but per the `portfolio-roadmap` memory this is
+   explicitly "partially pre-empted" by an existing GRPO K-way prefix-
+   sharing derivation elsewhere in the portfolio — lower marginal learning
+   value, much of the intellectual content already banked. Nice-to-have,
+   not a priority.
+5. **Phase 5 (real disaggregation)** — highest novelty (genuine new
+   mechanism, real cross-process KV handoff) and spec.md itself calls it
+   "the single most direct predict-then-validate moment in this repo" —
+   but also spec.md's own reach goal, and the time cost (real multi-
+   process orchestration, real infra) is at least as high as Phase 3's.
+   Only chase with real time to spare.
 
-**Division of labor for Phase 2, explicitly decided (not the Phase 1
-default carried over blindly)**: steps 1-2 below are boilerplate/scaffolding
-— synthetic load generation and a measurement harness, the same category of
-work as `scripts/continuous_batching_demo.py` and
-`scripts/preemption_sanity_check.py`, both of which Claude wrote directly
-with no back-and-forth needed. **Step 3 is different and should NOT be
-offloaded the same way.** It's marked 🧠 in spec.md specifically because
-it's judgment-heavy, not scaffolding — and per the missing-doc point above,
-Claude doesn't have `disagg_and_placement_notes.md`'s actual modeling
-assumptions to reason from even if it wanted to. The plan: Claude builds
-1-2 and hands back raw numbers; the predicted-vs-real interpretation in 3
-happens as a sounding-board conversation (same pattern as the eviction
-policy decision in the second GPU session), not as a Claude-authored
-writeup.
+**Explicitly not recommended** (already declined elsewhere in the
+portfolio, would be scope creep here too): CPU/SSD KV-cache tiering
+(declined twice already per the roadmap memory), pipeline/expert
+parallelism (spec.md's own "Note on scope" section excludes both).
 
-**Per spec.md's Phase 2 section:**
-1. Build a synthetic request generator matching the same distributional
-   assumptions the discrete-event simulator used (`disagg_and_placement_notes.md`
-   §4) — Poisson arrivals, a realistic prompt/output-length distribution —
-   so results are actually comparable to the simulator's predictions, not a
-   different workload shape.
-2. Measure real throughput (req/s), TTFT, per-token decode latency, and GPU
-   occupancy under a swept load.
-3. Write the predicted-vs-real comparison: the simulator found prefill's
-   fixed compute ceiling (~4,138 req/s in that setup), not decode capacity
-   or the KV pool, was the real bottleneck. Does real hardware confirm that
-   shape, or does something the simulator's abstraction missed show up for
-   real (kernel launch overhead, scheduling overhead, memory fragmentation)?
-   A genuine, checked answer either way is the actual checkpoint —
-   disagreement here is a more interesting finding than agreement.
+spec.md's own fallback logic still applies regardless of which of these
+get attempted: a complete Phase 2.5 is worth more than a half-built Phase
+5 — stop after whichever one just finished cleanly if time runs out.
 
-`append_slot`'s CoW branch and starvation avoidance under sustained load
-stay deferred indefinitely (see "Deliberately deferred" above) —
-unaffected by Phase 2, though the latter is worth watching for during the
-load sweep.
+## Immediate next steps — Phase 2.5 (chunked prefill)
+
+**What it is**: split a request's prefill into multiple scheduling
+iterations (bounded chunks of the prompt) instead of one uninterruptible
+step that processes the whole prompt at once — interleaved with other
+requests' decode steps the same way prefill/decode are already mixed
+today. Production term for this: Sarathi-Serve-style chunked prefill.
+
+**Why now, concretely**: `scheduler.py`'s `NEEDS_PREFILL` branch currently
+always allocates and admits a request's *entire* prompt in a single
+`schedule()` call, and `model_runner.forward()`'s prefill path always
+contributes the *entire* prompt as both write and read positions
+(`req.all_token_ids()`, `range(req.total_len)`) in one `forward()` call.
+That's real head-of-line blocking: a big prefill step can stall every
+decode request already in flight for that step's whole duration — which
+is exactly what `benchmark_results_final.csv`'s unbounded TTFT growth past
+saturation reflects, and what `pct_wall_time_prefill_or_mixed` (~33-35% at
+saturation, from steps that are only ~8% of the count) shows directly.
+
+**What's already there, ready to use**: `Request.num_computed_tokens`
+exists on the dataclass, is already reset to 0 on `preempt()`, but is
+**not currently incremented or read anywhere else** — this is the field
+chunked prefill needs to track how much of a request's prompt has been
+prefilled so far. `block_manager`'s `can_append_slot`/`append_slot`
+incremental-growth machinery (built for decode's 1-token-at-a-time growth)
+may or may not transplant directly to per-chunk growth — worth checking
+before building something new.
+
+**Real design forks to surface explicitly, not silently resolve** (same
+discipline as the eviction-policy decision, the depth-vs-width cap
+question, etc. — see "How this session worked" below):
+- Chunk sizing policy: fixed chunk size, vs. "fill whatever's left of
+  `max_num_batched_tokens`'s budget after decode work is admitted" (the
+  real production answer, closer to Sarathi-Serve). This interacts
+  directly with Bug 2's fix above (a lone candidate always gets admitted
+  regardless of cost) — chunking changes what "a candidate's cost" even
+  means for a partially-prefilled request, worth thinking through together
+  before implementing either.
+- How a partially-prefilled request's block table should grow chunk-by-
+  chunk.
+- Whether decode still gets scheduling priority within an iteration that
+  also contains a prefill chunk (today: yes, running-before-waiting).
+
+**Correctness oracle**: token-for-token match against the current
+one-shot-prefill path on identical prompts — chunking must not change
+*what* gets generated, only *how* the compute gets scheduled.
+
+**Real measurement, the actual checkpoint**: does chunking flatten the
+TTFT-vs-load curve from `benchmark_results_final.csv`, at the cost of some
+decode throughput (a chunk's compute now shares an iteration with decode
+steps it previously didn't)? A genuine before/after against Phase 2's own
+numbers — rerun `scripts/benchmark_load.py` with the same config
+(`--max-num-seqs 16 --max-prompt-len 2048 --max-output-len 512`) post-fix
+and diff directly against the existing CSV, not a fresh, incomparable run.
+
+**Division of labor**: same pattern as Phase 2 and the eviction-policy
+decision — the design forks above get surfaced and decided together, then
+implementation of the resolved result is Claude's to do directly,
+including in `scheduler.py`/`model_runner.py`.
+
+Phase 2's own report/writeup (the predicted-vs-real section spec.md's
+Phase 2 originally called for) is still open too — explicitly not a
+Claude-authored writeup per the established division of labor (see "How
+this session worked"), deferred behind Phase 2.5 at the user's own
+request, not forgotten.
 
 ## How this session worked, for continuity
 
@@ -362,34 +663,55 @@ load sweep.
   explicitly resolved (see next bullet), Claude implements the mechanical
   result directly, including in `block_manager.py`/`scheduler.py` (e.g. the
   `total_len`-vs-`prompt_len` sizing fix, the last-resort eviction wiring,
-  the block-growth invariant fix). The line that matters is: genuine
-  *design* decisions get surfaced, not silently made either way.
+  the block-growth invariant fix, all three Third-GPU-session bug fixes).
+  The line that matters is: genuine *design* decisions get surfaced, not
+  silently made either way.
 - **Real forks get surfaced explicitly, not silently resolved.** When
   eager-vs-last-resort eviction came up, Claude didn't just pick one — it
   was framed as an actual decision with tradeoffs and asked about directly
   (see commit `96bc229`'s message for the reasoning once resolved). Same
-  pattern expected for Phase 2's predicted-vs-real writeup (see "Immediate
-  next steps" above) and for anything else that's a judgment call rather
-  than a mechanical consequence of an already-settled decision.
+  pattern held for: the OOM fix approach (bound the batch vs. fix the
+  attention op vs. shrink the pool), the scheduler-starvation fix (always-
+  admit-lone-candidate vs. reject-oversized vs. chunked prefill), and the
+  post-Phase-2 roadmap ranking above. Expected to hold for chunked
+  prefill's own design forks (see "Immediate next steps") and anything
+  else that's a judgment call rather than a mechanical consequence of an
+  already-settled decision.
 - `spec.md` is a starting point, not a constraint to defer to reflexively —
-  said explicitly by the user mid-session. Don't treat its exact wording
-  (e.g. "token-for-token") as unable to flex when a real finding (e.g. bf16
-  drift) warrants it — but don't silently deviate either; that's also a
-  "surface it" moment, same as the bullet above.
+  said explicitly by the user mid-session, twice now (once for the bf16
+  correctness bar, once for the whole post-Phase-2 roadmap, which added a
+  phase spec.md never specified). Don't treat its exact wording as unable
+  to flex when a real finding warrants it — but don't silently deviate
+  either; that's also a "surface it" moment, same as the bullet above.
 - Review style: conceptual/logic bugs get Socratic guiding questions, not
   direct answers — syntax/typo-level mistakes get fixed directly, no
   ceremony. This produced several real caught bugs (see commit messages).
 - Testing philosophy: test everything possible without the GPU first
-  (pure-Python unit tests for `block_manager`/`scheduler`, zero torch
-  dependency) — GPU time is expensive/limited, so it should only be spent
-  validating what genuinely can't be checked any other way.
-- GPU workflow: this chat environment has no direct GPU access. The pattern
-  is Claude gives exact copy-paste shell commands, the user runs them on
-  the rented box and pastes output back, Claude reads/diagnoses from that.
-  Expect to iterate this way for Phase 2's load sweep too.
+  (pure-Python unit tests for `block_manager`/`scheduler`/`workload`, zero
+  torch dependency) — GPU time is expensive/limited, so it should only be
+  spent validating what genuinely can't be checked any other way. Held up
+  again this session: three real bugs (all in "Third GPU session" above)
+  were only findable under real load, not from unit tests or Phase 1's
+  light-load demos — real load sweeps are worth their GPU cost, not a
+  formality once unit tests pass.
+- GPU workflow: this chat environment has no direct GPU access. The
+  pattern is Claude gives exact copy-paste shell commands, the user runs
+  them on the rented box and pastes output back, Claude reads/diagnoses
+  from that — held up across a long iterative bug-fix loop this session
+  (four real GPU round-trips before a clean sweep ran), not just one-shot
+  demos.
 - Commit style: small, narrated commits matching the actual build sequence
   (not squashed) — "more commits the merrier," each with a real commit
   message explaining the *why*, not just the *what*. Push after every
   commit (or small batch) rather than batching a long series unpushed.
+  Benchmark result CSVs get committed too, not left only on the GPU box —
+  they disappear when the instance is released.
 - Comment style: terse. TODO markers stay one line, no restated context —
   established explicitly after an early draft was judged "too much hint."
+- Analytical rigor: when asked whether a finding generalizes, work through
+  *why* rather than reflexively agreeing or asserting — "decode isn't the
+  bottleneck" was correctly challenged as workload/concurrency-specific,
+  not a universal serving-systems truth, and the actual generalizable
+  claim (the conditional structure itself) is worth preserving precisely,
+  not flattened back into the more quotable but wrong universal version in
+  any future writeup.

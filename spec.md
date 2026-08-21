@@ -173,6 +173,63 @@ them — the actual point of continuous batching, confirmed, not assumed.
 an explicit predicted-vs-real section against your own prior simulator
 output.
 
+**Real data landed** (see `handoff.md`'s "Third GPU session" for the full
+story): throughput plateaus hard past a real saturation point, TTFT grows
+unboundedly past it, and — directly measured, not inferred — a small
+minority of steps by count (prefill-involving, ~8%) consume a
+disproportionate share of wall-clock time (~33-35%) at saturation. Real
+hardware confirms the simulator's qualitative shape; absolute numbers
+aren't comparable (1 A100/8B/bf16 here vs. a 29-machine TPU-8i/70B/FP4
+pool in the simulator) — only the mechanism transfers. The written report
+itself is still open, deliberately not Claude-authored (see handoff.md).
+
+---
+
+## Phase 2.5 — Stretch: chunked prefill (🧠, motivated directly by Phase 2's own real data, not originally in this spec)
+
+Not a phase this spec originally called for — added after Phase 2's real
+benchmark data made the case directly, not from speculation. `schedule()`'s
+`NEEDS_PREFILL` branch always admits a request's *entire* prompt in one
+scheduling iteration; `model_runner.forward()`'s prefill path always
+contributes the whole prompt as both write and read positions in one
+`forward()` call. That's real head-of-line blocking — a big prefill can
+stall every decode request already in flight for that step's whole
+duration, which is exactly what Phase 2's unbounded TTFT growth past
+saturation reflects, and what its direct prefill-time-share measurement
+(~33-35% of wall time from ~8% of steps) shows mechanistically.
+
+**The mechanism**: split a request's prefill into multiple scheduling
+iterations, each processing a bounded chunk of the prompt, interleaved
+with other requests' decode steps the same way prefill/decode are already
+mixed today. Production term: Sarathi-Serve-style chunked prefill.
+`Request.num_computed_tokens` already exists for exactly this (currently
+only reset on `preempt()`, never incremented or read elsewhere).
+
+**Real design questions, not defaults** (same discipline as every other
+🧠 decision in this spec): chunk sizing policy (fixed size vs. filling
+whatever's left of `max_num_batched_tokens`'s budget after decode work is
+admitted — the real production answer is usually the latter); how a
+partially-prefilled request's block table grows chunk-by-chunk (whether
+`block_manager`'s existing decode-growth machinery transplants directly);
+whether decode keeps scheduling priority within a chunk-containing
+iteration.
+
+**Correctness oracle**: token-for-token match against the current
+one-shot-prefill path on identical prompts — chunking must change *how*
+the compute is scheduled, not *what* gets generated.
+
+**Real measurement**: does chunking flatten the TTFT-vs-load curve from
+Phase 2's own benchmark data, at the cost of some decode throughput
+(interleaving means a chunk's compute now shares an iteration with decode
+steps it previously didn't)? A genuine before/after against Phase 2's own
+numbers (`benchmark_results_final.csv`), same discipline as every other
+real-measurement checkpoint in this spec.
+
+Ranked ahead of Phases 3-5 for now — see `handoff.md`'s "Roadmap after
+Phase 2" for the full reasoning across time cost, learning/time ratio, and
+company fit. This spec was never meant to be followed past the point real
+data disagrees with its own priorities.
+
 ---
 
 ## Phase 3 — Stretch: real tensor parallelism for a model that doesn't fit on one GPU (🧠, first-priority stretch, subject to the post-Phase-2 triage)
@@ -271,10 +328,27 @@ Phase 1 alone — a correct, working, continuously-batched, paged-KV
 single-GPU engine — is already a complete, real, demoable artifact: it's
 the one thing in this entire repo that isn't analytical or simulated.
 Phase 2 (real benchmarking vs. your own simulator's predictions) is the
-natural close-the-loop addition and the strongest interview story. Phases
-3 (real tensor parallelism), 4 (real paged kernel), and 5 (real
-disaggregation) are genuine stretch goals, in priority order — valuable
-if time allows, not required to call this project done. If time runs out
-partway through the stretch phases, stop after whichever one just
-finished cleanly rather than leaving one half-done — a complete Phase 3
-is worth more than a half-built Phase 5.
+natural close-the-loop addition and the strongest interview story — and
+is now data-complete (see Phase 2's "Real data landed" note above).
+
+**Stretch priority, re-ranked after Phase 2's real data came in** (see
+`handoff.md`'s "Roadmap after Phase 2" for the full reasoning across time
+cost, learning/time ratio, novelty vs. skills already demonstrated
+elsewhere in the portfolio, and target-company fit): **Phase 2.5
+(chunked prefill)** first — cheapest, highest learning ratio, and closes a
+gap Phase 2's own numbers exposed, not a speculative one. **Phase 4 (real
+paged-attention kernel)** second — same motivation (fixes the eager-
+attention memory-scaling problem Phase 2's GPU runs actually hit),
+extends an existing skill into a genuinely different technique rather
+than composing one already banked. **Phase 3 (real tensor parallelism)**
+third — still valuable, the most direct "Anthropic/OpenAI-scale
+inference" story, but the most expensive and the lowest incremental
+learning ratio given existing real ZeRO/FSDP/DDP experience. **Phase 5
+(real disaggregation)** last — highest novelty and the most direct
+predict-then-validate story in this repo, but also the highest time cost;
+only chase with real time to spare.
+
+If time runs out partway through the stretch phases, stop after whichever
+one just finished cleanly rather than leaving one half-done — a complete
+Phase 2.5 is worth more than a half-built Phase 5, same logic as before,
+just re-pointed at the new ordering.
