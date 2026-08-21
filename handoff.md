@@ -1,4 +1,4 @@
-# Handoff — serving-engine, Phase 1+2+2.5 complete, starting Phase 4 (paged-attention kernel)
+# Handoff — serving-engine, Phase 1+2+2.5+prefix-caching complete, Phase 4 (paged-attention kernel) next
 
 Written so a fresh chat session (or future you) can pick up exactly where
 this one left off, without re-deriving anything already settled. Read
@@ -7,33 +7,44 @@ scope) — this doc covers everything *since* Phase 0 that spec.md doesn't
 capture: real implementation decisions, bugs found and fixed, real
 benchmark data, and what's actually left before Phase 4 is checkpointed.
 
-**Repo:** https://github.com/ayush-os/serving-engine (public), 60+ commits on
+**Repo:** https://github.com/ayush-os/serving-engine (public), 70+ commits on
 `main` as of this doc — check `git log` for the current count, it'll be
 stale immediately.
 
 ## Status in one line
 
-**Phase 1, Phase 2, and Phase 2.5 are all fully checkpointed.** Phase 1:
-`test_correctness.py` passes (2 exact matches, 1 `xfail` for expected bf16
-drift), `scripts/continuous_batching_demo.py` shows a 1.71x speedup with
-sustained GPU utilization (see "First GPU session"), `preempt()`/eviction
-GPU-verified (see "Second GPU session"). Phase 2: a real load sweep ran
-end-to-end on real hardware (`scripts/benchmark_load.py`), found and fixed
-three real bugs along the way, and produced a genuine predicted-vs-real
-read against `disagg_and_placement_notes.md`'s Finding 3 — see "Third GPU
-session" below for the full story, findings, and what does/doesn't
-generalize from them. Phase 2.5 (chunked prefill): implemented, GPU-
-correctness-verified, and re-benchmarked against Phase 2's own config —
-the real finding is narrower and more interesting than the original
-hypothesis ("chunking flattens the TTFT-vs-load curve" was wrong; the real
-effect is a tail-latency fix pre-saturation, not a saturation-ceiling fix)
-— see "Fourth GPU session" below for the full story and exactly why.
-**Phase 4 (real paged-attention kernel) is next**, directly motivated by
-that finding: Phase 2.5 pinned the saturation-ceiling bottleneck down to
+**Phase 1, Phase 2, Phase 2.5, and prefix-caching (`fork()`'s original
+roadmap slot, done out of order — see below) are all fully checkpointed.**
+Phase 1: `test_correctness.py` passes (2 exact matches, 1 `xfail` for
+expected bf16 drift), `scripts/continuous_batching_demo.py` shows a 1.71x
+speedup with sustained GPU utilization (see "First GPU session"),
+`preempt()`/eviction GPU-verified (see "Second GPU session"). Phase 2: a
+real load sweep ran end-to-end on real hardware
+(`scripts/benchmark_load.py`), found and fixed three real bugs along the
+way, and produced a genuine predicted-vs-real read against
+`disagg_and_placement_notes.md`'s Finding 3 — see "Third GPU session"
+below for the full story, findings, and what does/doesn't generalize from
+them. Phase 2.5 (chunked prefill): implemented, GPU-correctness-verified,
+and re-benchmarked against Phase 2's own config — the real finding is
+narrower and more interesting than the original hypothesis ("chunking
+flattens the TTFT-vs-load curve" was wrong; the real effect is a
+tail-latency fix pre-saturation, not a saturation-ceiling fix) — see
+"Fourth GPU session" below for the full story and exactly why.
+**Prefix-caching**: hash-based block matching (`BlockManager.match_prefix`/
+`register_computed_blocks`), built ahead of Phase 4 on a live re-ranking
+(bounded scope, low finish-risk, "knock it out quick" — see "Fifth GPU
+session" below) — GPU-correctness-verified (1 real `xfail`, same
+bf16/kernel-non-determinism class as every prior precedent, root-caused
+via a dedicated diagnostic script) and benchmarked at a real 1.53x
+wall-clock speedup on a shared-system-prompt-style workload. **Phase 4
+(real paged-attention kernel) is next**, directly motivated by Phase 2.5's
+own finding: it pinned the saturation-ceiling bottleneck down to
 admission-queue depth (`max_num_seqs`, a defensive cap against the eager
-attention op's unbounded memory scaling), which chunking structurally
-can't touch but a tiled kernel plausibly can. See "Roadmap after Phase 2"
-and "Immediate next steps — Phase 4" at the bottom.
+attention op's unbounded memory scaling), which neither chunking nor
+prefix-caching touch but a tiled kernel plausibly can. See "Roadmap after
+Phase 2" and "Immediate next steps — Phase 4" at the bottom (both still
+accurate — prefix-caching's insertion ahead of Phase 4 was a scheduling
+change, not a re-ranking of Phase 4's own motivation).
 
 ## First GPU session — model swap, real bugs found, correctness result
 
@@ -120,12 +131,16 @@ serving_engine/
                       2.5): incremented per chunk in update_after_step(),
                       reset to 0 on preempt() as before.
   block_manager.py   allocate/append_slot/free/fork/preempt all done, GPU-
-                      verified. append_slot's CoW branch still stubbed
-                      (deliberately, see "Deliberately deferred" below).
-                      Unchanged by Phase 2.5 -- allocate()'s existing
-                      ceil(total_len/block_size) upfront reservation already
-                      covers a request's full prefill regardless of
-                      chunking, confirmed in "Fourth GPU session" below.
+                      verified. append_slot's CoW branch removed (not
+                      needed -- see "Deliberately deferred" below).
+                      allocate()'s ceil(total_len/block_size) upfront
+                      reservation now delta-based against any already-
+                      populated block_table, confirmed in "Fourth GPU
+                      session" (chunking) and "Fifth GPU session" (prefix
+                      caching) below. Fifth GPU session: match_prefix()/
+                      register_computed_blocks() -- chained-hash block
+                      matching/registration, GPU-verified, real 1.53x
+                      speedup on a shared-prefix workload.
   scheduler.py        schedule()/update_after_step() done, GPU-verified.
                       Last-resort LIFO eviction + max_num_batched_tokens/
                       max_num_seqs cap both implemented, enforced, and
@@ -669,15 +684,173 @@ plausibly *can*, by making memory usage small and predictable regardless
 of batch composition — which is the direct, now-data-backed motivation
 for Phase 4, not just "kernel work is the natural next thing."
 
+## Fifth GPU session — prefix-caching: a live re-ranking, real design forks, two real test bugs, a confirmed xfail
+
+Built ahead of Phase 4 on a live, mid-conversation decision, not the
+roadmap's original order (`spec.md`/this doc both had it ranked as "the
+fast second phase *after* Phase 4"). Reasoning at the time: bounded scope,
+low finish-risk, and — since Claude does the actual implementation once a
+design fork is resolved (same division of labor as every other phase) —
+the user's own time cost was mostly design/review, not typing. Real
+tradeoff, stated explicitly rather than silently reordered: pulling it
+ahead spends session budget that would otherwise go to Phase 4, the phase
+with the stronger data-backed motivation (Phase 2.5 pinned the
+saturation-ceiling bottleneck on `max_num_seqs`, which prefix-caching
+doesn't touch at all). Accepted anyway — see the chat history for the
+full back-and-forth, not reproduced here.
+
+### Design, resolved before any code got written
+
+- **Hash granularity: chained, not content-only, and full-blocks-only.**
+  `hash_i = hash((hash_{i-1}, tuple(block_i_tokens)))`, seeded `hash_0`'s
+  parent as `None`. Content-only (unchained) hashing was seriously
+  considered and rejected: a block's real KV values depend on everything
+  before it via causal self-attention, so two different histories that
+  happen to produce identical *later*-block content would hash to the same
+  key under content-only hashing, and whichever got registered last would
+  silently win — a real, findable bug (constructed and walked through
+  explicitly in chat, not hypothetical). Chaining makes that structurally
+  impossible: different history → different hash → no collision. Only full
+  `block_size`-token chunks are ever hashed; a prompt's trailing partial
+  block is never shared.
+- **CoW stays stubbed, genuinely not just deferred.** Because matching only
+  ever shares *full* blocks, `append_slot`'s existing growth path never
+  writes into a block another request might still be reading — the `# TODO:
+  Handle CoW case` comment in `block_manager.py` was removed outright, not
+  implemented, since this mechanism structurally never exercises it. (Real
+  again for a future beam-search-style `fork()` that shares a *partial*
+  last block — just not this.)
+- **Match only fires once, at `add_request()`, over `prompt_token_ids`
+  only.** Never re-run on a preemption recompute (which re-enters
+  `self.waiting` directly, bypassing `add_request()`) and never extended
+  into `output_token_ids` — sampled output is request-specific and
+  essentially never coincides across requests, so there's nothing there
+  worth matching, only wasted hashing work.
+- **`can_allocate`/`allocate` generalized from "assume `block_table` starts
+  empty" to delta-based** (`ceil(total_len/block_size) - len(block_table)`)
+  — so a request arriving with a pre-matched prefix only claims the
+  unmatched remainder, not the full request size.
+- **A real bug caught in review before ever reaching the GPU**: the first
+  draft of `register_computed_blocks` wrote `hash_to_block[h] =
+  block.block_id` unconditionally. Two requests can independently miss the
+  cache for identical content before either registers (arguably the most
+  realistic real-world trigger for this whole feature — two near-
+  simultaneous users sending the same system prompt), landing on distinct
+  physical blocks; the second registration would silently overwrite the
+  first's entry, and freeing them in either order either `KeyError`s (entry
+  already deleted) or orphans a still-live, still-referenced block from the
+  lookup table forever. Fixed to first-writer-wins before any GPU time was
+  spent — caught by review, not by a crash. Regression-tested in pure
+  Python (`test_register_computed_blocks_first_writer_wins_on_collision`).
+- **Sharing only ever works between concurrently-alive requests — not a
+  bug, a real scope boundary.** `free()` hard-releases *and* invalidates a
+  block's hash the instant `ref_count` hits 0 (correctly — that physical
+  slot is about to be handed to an unrelated future allocation). There's no
+  retention/soft-eviction window after a request actually finishes, unlike
+  real vLLM's LRU-evictable cache pool — building that would be real,
+  separate scope (explicitly not attempted here, matches the "quick win"
+  framing this was pulled forward under).
+
+Pure-Python coverage: 10 new tests across `test_block_manager.py`/
+`test_scheduler.py` (match hit/miss/partial-divergence/trailing-partial-
+block, register's chunk-order-independent resume via `content_hash`, the
+first-writer-wins collision, `free()`'s invalidation including the
+still-shared case, the `can_allocate`/`allocate` delta fix, and a
+scheduler-level end-to-end proving the actual point of the feature — a
+second identical-prompt request gets `prefill_chunk_sizes == 0` and lands
+in `prefill_final_chunk` the same step it's admitted). 50/50 passing before
+any GPU time.
+
+### GPU round trip: two real test bugs, zero implementation bugs
+
+Both caught by the GPU, both in the *test*, not the mechanism — worth
+being precise about which, same discipline as every other GPU session:
+
+1. **Test prompt too short.** `"In machine learning, a transformer is"`
+   tokenizes to 8 tokens (BOS + 7) — under `block_size=16`, so
+   `match_prefix` correctly had zero full blocks to match. The test's own
+   setup assertion (`num_computed_tokens > 0`) caught this directly. Fixed
+   with a longer prompt.
+2. **Warmup finished-and-freed before it could register.** `max_new_tokens=
+   1` meant the warmup's prefill completion and its own finish condition
+   landed in the same engine step; `update_after_step()`'s `if/elif` takes
+   the `FINISHED`/`free()` branch in that case, never reaching the `elif`
+   that calls `register_computed_blocks`. This is where the "concurrent-
+   only sharing" scope boundary above was actually discovered, not just
+   theorized — the test needed the warmup to still be alive (mid-decode,
+   `max_new_tokens=5`, one `step()`) when the real request arrived, not run
+   to completion first. Considered reordering `update_after_step()` to
+   register before the finish check; concluded it would be inert (a sole
+   owner finishing in the same step still nets `ref_count` back to 0
+   immediately regardless of ordering, since nothing else could have
+   forked onto an as-yet-unregistered block first) — correctly *not* made,
+   avoiding complexity with no real behavioral effect.
+
+`prefix_cache_demo.py` also crashed once on its first real run — a CUDA
+`indexSelectLargeIndex` assertion, immediately on request 0's first
+`forward()`. Not a prefix-caching bug either: the demo's synthetic suffix
+token ids used arbitrary `900_000+` offsets, nowhere near Llama 3.1's
+~128k vocab — a plain out-of-range index into the embedding lookup that
+surfaces as an opaque CUDA assertion on GPU instead of a Python
+`IndexError`. The script's own docstring claimed it matched
+`benchmark_load.py`'s synthetic-token convention but never actually
+implemented the vocab-bounding; fixed to actually match it
+(`_random_token_ids`, bounded to `tokenizer.vocab_size`, excluding
+`special_ids`).
+
+### Correctness: one real xfail, root-caused, same class as every precedent
+
+`test_prefix_cache_matches_uncached` diverged from the uncached path on
+first run — a real output mismatch, not a superficial one (different
+wording by the end of the 32-token window). Rather than pattern-match
+against prior xfails from the text diff alone, wrote a dedicated
+diagnostic (`scripts/diagnose_prefix_cache_divergence.py` — replicates
+`LLMEngine.step()`'s own logic directly, since `step()` doesn't expose raw
+logits) to find the actual first-diverging output token and compare raw
+logits there. Result: diverges at output token 24, near-tied argmax (279
+`" the"` vs 264 `" a"`, both ~22.375, max abs diff 0.1875), identical top-5
+set just reordered — the same signature as every other bf16/kernel-non-
+determinism xfail already in this file (Phase 1's fibonacci case, Phase
+2.5's two chunked-prefill cases). Root cause identified precisely, not
+just pattern-matched: the cached path's real request shares a batch with
+the still-decoding warmup request (continuous batching), a genuinely
+different batch shape at the kernel level than the uncached path's solo
+batch — same underlying non-determinism source as chunked prefill's own
+xfails, just triggered by concurrency instead of chunk size. Confirms
+`match_prefix`/`register_computed_blocks`/the read-index path are all
+correct — the shared block's own bytes are bit-identical either way, the
+noise is downstream in decode, not in the caching mechanism. Marked
+`xfail(strict=False)` with the diagnostic inline, same treatment as every
+prior precedent.
+
+### The real benchmark: `prefix_cache_demo.py`
+
+16 synthetic requests, 512-token shared system-prompt-style prefix (32
+full blocks), added one at a time with a `step()` between each so later
+requests actually see an already-registered prefix (not a naive
+all-added-up-front pattern, which would never exercise a real cache hit —
+`match_prefix` runs synchronously inside `add_request()`, before any
+compute has happened). Result: request 0 correctly matches 0/528 (nothing
+cached yet), requests 1–15 all match 512/528 at admission — 15/15 real
+cache hits under actual GPU execution, not just pure-Python tests. Real
+wall-clock: **2.42s (shared) vs 3.70s (unshared control, same request
+count/shape, distinct prefixes) — a 1.53x speedup**, purely from skipping
+redundant prefill compute across concurrently-alive requests.
+
 ## Deliberately deferred — not bugs, don't "fix" these reflexively
 
-- **`block_manager.py`: `append_slot`'s CoW branch** (marked `# TODO`) —
-  needed only once `fork()` is actually exercised by real prefix-sharing,
-  which nothing currently triggers (no scheduler-level prefix detection
-  exists). No longer "deferred indefinitely" with no plan — it's now a
-  real (if low-priority) roadmap candidate, see "Roadmap after Phase 2"
-  below. Confirmed via `grep` this session: `fork()` is only ever called
-  from `tests/test_block_manager.py`, never from `scheduler.py`/`engine.py`.
+- **`block_manager.py`: `append_slot`'s CoW branch** — resolved, not just
+  deferred, in the Fifth GPU session: prefix-caching got built via a new
+  `match_prefix`/`register_computed_blocks` mechanism, deliberately *not*
+  via `fork()` (still only ever called from `tests/test_block_manager.py`,
+  confirmed again this session — real prefix-sharing didn't end up
+  routing through it). Because matching only ever shares *full* blocks,
+  `append_slot`'s growth path structurally never writes into a block
+  another request might still be reading — CoW is never exercised by this
+  mechanism. The `# TODO` comment was removed outright (see "Fifth GPU
+  session"), not implemented. Still real and open for a future
+  beam-search-style `fork()` that would share a *partial* last block —
+  just not something this project currently does.
 - **Starvation avoidance under sustained load** — the last-resort eviction
   trigger (see "Second GPU session" above) only fires when *nothing at all*
   progressed this step. A persistently unlucky candidate could in theory
@@ -758,17 +931,17 @@ it, not duplicated in full here).
    adjacent, even though the inference-specific KV-cache-across-ranks
    details are genuinely new. Still worth doing eventually for the
    OpenAI/Anthropic-fit value.
-4. **Prefix-sharing / finishing `fork()`** — real and bounded (ref-
-   counting already exists, needs scheduler-level prefix detection at
-   admission time), but per the `portfolio-roadmap` memory this is
-   explicitly "partially pre-empted" by an existing GRPO K-way prefix-
-   sharing derivation elsewhere in the portfolio — lower marginal learning
-   value, much of the intellectual content already banked. Nice-to-have,
-   not a priority. Explicitly the pick for a fast "second phase after
-   Phase 4" if time allows (decided directly with the user this session)
-   — TP and disaggregation are each real standalone undertakings with
-   meaningful failure-to-finish risk of their own, not bonus-slot
-   material.
+4. ~~**Prefix-sharing**~~ — **done**, out of order relative to this
+   ranking (see "Fifth GPU session" above for the full story and why it
+   got pulled ahead of Phase 4 mid-conversation: bounded scope, low
+   finish-risk, and Claude does the implementation once a design fork
+   resolves, so the user's own time cost was mostly design/review). Built
+   as `match_prefix`/`register_computed_blocks`, not via `fork()` (which
+   stays unused outside tests, still real for a future beam-search-style
+   partial-block share). Real result: GPU-correctness-verified (1 xfail,
+   confirmed same bf16/kernel-non-determinism class as every other
+   precedent in this file) and a genuine 1.53x wall-clock speedup on a
+   shared-system-prompt-style workload.
 5. **Phase 5 (real disaggregation)** — highest novelty (genuine new
    mechanism, real cross-process KV handoff) and spec.md itself calls it
    "the single most direct predict-then-validate moment in this repo" —

@@ -391,14 +391,19 @@ expensive and the lowest incremental learning ratio given existing real
 ZeRO/FSDP/DDP experience, and (per the user, since Phase 4 is likely the
 last phase attempted) the real finish-risk of a multi-GPU/distributed
 debugging phase matters more now with no next phase to fall back to.
-**Prefix-sharing / finishing `fork()`** is the one candidate for a fast
-second phase after Phase 4 if time allows — real and bounded, though
-partially pre-empted by an existing derivation elsewhere in the
-portfolio (lower marginal learning value) — TP and disaggregation are
-each standalone undertakings with their own finish-risk, not bonus-slot
-material. **Phase 5 (real disaggregation)** last — highest novelty and
-the most direct predict-then-validate story in this repo, but also the
-highest time cost; only chase with real time to spare.
+~~**Prefix-sharing / finishing `fork()`**~~ — **done**, out of the order
+above: pulled ahead of Phase 4 on a live mid-session call (bounded scope,
+low finish-risk — see `handoff.md`'s "Fifth GPU session"), not run as the
+"fast second phase after Phase 4" this section originally proposed. Built
+as `match_prefix`/`register_computed_blocks` (chained-hash block
+matching), not via `fork()` itself, which stays real but unused outside
+tests. GPU-correctness-verified (1 `xfail`, confirmed same bf16/kernel-
+non-determinism class as every other precedent in this doc) and
+benchmarked at a real 1.53x wall-clock speedup on a shared-prefix
+workload — see `handoff.md` for the full story. **Phase 5 (real
+disaggregation)** last — highest novelty and the most direct predict-
+then-validate story in this repo, but also the highest time cost; only
+chase with real time to spare.
 
 If time runs out partway through the stretch phases, stop after whichever
 one just finished cleanly rather than leaving one half-done — a complete
