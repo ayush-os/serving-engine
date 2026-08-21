@@ -109,9 +109,11 @@ class ModelRunner:
         for group_idx, req in enumerate(scheduler_output.scheduled_requests):
             start = len(toks)
             if req.phase == RequestPhase.NEEDS_PREFILL:
-                toks += req.all_token_ids()
-                write_positions = range(req.total_len)
-                read_positions = range(req.total_len)
+                chunk_size = scheduler_output.prefill_chunk_sizes[req.request_id]
+                chunk_start = req.num_computed_tokens
+                toks += req.all_token_ids()[chunk_start:chunk_start + chunk_size]
+                write_positions = range(chunk_start, chunk_start + chunk_size)
+                read_positions = range(chunk_start + chunk_size)
             else:  # NEEDS_DECODE
                 toks.append(req.output_token_ids[-1])
                 write_positions = [req.total_len - 1]
