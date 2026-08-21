@@ -27,34 +27,53 @@ What to look for in the output:
     (no measurable difference) is itself a real, worth-reporting finding,
     same discipline as every other benchmark checkpoint in this project.
 """
+import random
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from transformers import AutoTokenizer
+
 from serving_engine.block import BLOCK_SIZE
 from serving_engine.engine import LLMEngine
+from serving_engine.model_runner import MODEL_NAME
 
 NUM_REQUESTS = 16
 SHARED_PREFIX_LEN = BLOCK_SIZE * 32  # 512 tokens, 32 full blocks -- all matchable
 SUFFIX_LEN = 16                      # unique per-request tail, never shared
 MAX_NEW_TOKENS = 32
+SEED = 0
 
-SHARED_PREFIX = list(range(SHARED_PREFIX_LEN))  # arbitrary but fixed synthetic ids
+
+def _random_token_ids(rng, vocab_size, special_ids, n):
+    """Same convention as scripts/benchmark_load.py: bounded to the real
+    vocab (an out-of-range id crashes the embedding lookup on GPU -- a
+    plain IndexError locally, but an opaque CUDA assertion remotely) and
+    excluding special tokens (EOS mid-prompt is harmless here since
+    ignore_eos=True, but there's no reason to risk it)."""
+    ids = []
+    while len(ids) < n:
+        tid = rng.randrange(vocab_size)
+        if tid not in special_ids:
+            ids.append(tid)
+    return ids
 
 
-def run(scenario: str) -> float:
+def run(scenario: str, vocab_size: int, special_ids: set) -> float:
     engine = LLMEngine(num_gpu_blocks=2048)
+    rng = random.Random(SEED)  # fresh, deterministic per scenario -- same prefix content across both runs
+    shared_prefix = _random_token_ids(rng, vocab_size, special_ids, SHARED_PREFIX_LEN)
     request_ids = []
     start = time.monotonic()
 
     for i in range(NUM_REQUESTS):
         if scenario == "shared":
-            prefix = SHARED_PREFIX
-        else:  # "unshared" -- distinct token-id range per request, same length, never overlaps
-            prefix = list(range(i * 100_000, i * 100_000 + SHARED_PREFIX_LEN))
-        suffix = list(range(900_000 + i * 100, 900_000 + i * 100 + SUFFIX_LEN))
+            prefix = shared_prefix
+        else:  # "unshared" -- freshly sampled per request, same length, never overlaps in practice
+            prefix = _random_token_ids(rng, vocab_size, special_ids, SHARED_PREFIX_LEN)
+        suffix = _random_token_ids(rng, vocab_size, special_ids, SUFFIX_LEN)
 
         rid = engine.add_request(
             prompt_token_ids=prefix + suffix, max_new_tokens=MAX_NEW_TOKENS, ignore_eos=True,
@@ -71,11 +90,15 @@ def run(scenario: str) -> float:
 
 
 def main():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    vocab_size = tokenizer.vocab_size
+    special_ids = set(tokenizer.all_special_ids)
+
     print(f"Scenario 'shared': {NUM_REQUESTS} requests, {SHARED_PREFIX_LEN}-token common prefix\n")
-    shared_time = run("shared")
+    shared_time = run("shared", vocab_size, special_ids)
 
     print(f"\nScenario 'unshared': {NUM_REQUESTS} requests, distinct {SHARED_PREFIX_LEN}-token prefixes\n")
-    unshared_time = run("unshared")
+    unshared_time = run("unshared", vocab_size, special_ids)
 
     print(f"\n=== Results ===")
     print(f"shared:   {shared_time:.2f}s total")
