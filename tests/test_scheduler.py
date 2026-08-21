@@ -177,7 +177,11 @@ def test_update_after_step_advances_phase_when_not_finished():
     sched.block_manager.allocate(req)
     req.output_token_ids = [1]  # this iteration's prefill step produced 1 token
 
-    sched.update_after_step(SchedulerOutput(scheduled_requests=[req]))
+    sched.update_after_step(SchedulerOutput(
+        scheduled_requests=[req],
+        prefill_chunk_sizes={"a": 4},
+        prefill_final_chunk={"a"},
+    ))
 
     assert req.phase == RequestPhase.NEEDS_DECODE
     assert req.status != RequestStatus.FINISHED
