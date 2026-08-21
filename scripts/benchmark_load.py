@@ -132,7 +132,14 @@ def run_rate(
     seen_ids = set()
     ttft = {}
     completion_latency = {}
-    decode_step_times = []
+    # Steps are classified by composition, not just "was anything new admitted":
+    # pure_decode (every scheduled request already past its first token) is
+    # the existing per-token-latency signal; pure_prefill (every scheduled
+    # request new this step) and mixed (both) are split out too, so "prefill
+    # dominates wall time at saturation" is something the CSV shows directly
+    # instead of something inferred from decode latency staying flat.
+    step_kind_time = {"pure_prefill": 0.0, "pure_decode": 0.0, "mixed": 0.0}
+    step_kind_count = {"pure_prefill": 0, "pure_decode": 0, "mixed": 0}
     step_count = 0
     num_completed = 0
 
@@ -165,19 +172,31 @@ def run_rate(
         step_dt = time.monotonic() - step_t0
         step_count += 1
 
-        is_pure_decode = bool(scheduler_output.scheduled_requests)
+        num_new = 0
+        num_old = 0
         for req in scheduler_output.scheduled_requests:
             if req.request_id not in seen_ids:
-                is_pure_decode = False
+                num_new += 1
                 ttft[req.request_id] = time.monotonic() - req.arrival_time
+            else:
+                num_old += 1
             seen_ids.add(req.request_id)
             if req.is_finished:
                 completion_latency[req.request_id] = time.monotonic() - req.arrival_time
                 last_completion_wall = time.monotonic()
                 num_completed += 1
 
-        if is_pure_decode:
-            decode_step_times.append(step_dt)
+        if num_new and num_old:
+            kind = "mixed"
+        elif num_new:
+            kind = "pure_prefill"
+        elif num_old:
+            kind = "pure_decode"
+        else:
+            kind = None  # scheduler_output.scheduled_requests was empty
+        if kind is not None:
+            step_kind_time[kind] += step_dt
+            step_kind_count[kind] += 1
 
         if time.monotonic() - last_progress_print > 5:
             print(f"  rate={rate}: {num_completed}/{len(workload)} completed, {step_count} steps so far...")
@@ -187,7 +206,12 @@ def run_rate(
 
     wall = (last_completion_wall - first_arrival_wall) if (first_arrival_wall and last_completion_wall) else None
     ttft_ms = [v * 1000 for v in ttft.values()]
-    decode_ms = [v * 1000 for v in decode_step_times]
+
+    def _mean_ms(kind):
+        return (step_kind_time[kind] / step_kind_count[kind] * 1000) if step_kind_count[kind] else None
+
+    total_step_time = sum(step_kind_time.values())
+    prefill_involved_time = step_kind_time["pure_prefill"] + step_kind_time["mixed"]
 
     return {
         "offered_rate_req_s": rate,
@@ -197,7 +221,18 @@ def run_rate(
         "ttft_mean_ms": (sum(ttft_ms) / len(ttft_ms)) if ttft_ms else None,
         "ttft_p50_ms": _percentile(ttft_ms, 50),
         "ttft_p99_ms": _percentile(ttft_ms, 99),
-        "decode_latency_mean_ms": (sum(decode_ms) / len(decode_ms)) if decode_ms else None,
+        "decode_latency_mean_ms": _mean_ms("pure_decode"),
+        "prefill_step_time_mean_ms": _mean_ms("pure_prefill"),
+        "mixed_step_time_mean_ms": _mean_ms("mixed"),
+        "num_pure_prefill_steps": step_kind_count["pure_prefill"],
+        "num_pure_decode_steps": step_kind_count["pure_decode"],
+        "num_mixed_steps": step_kind_count["mixed"],
+        # Direct measurement of "prefill dominates wall time at saturation"
+        # instead of inferring it from decode latency staying flat -- the
+        # fraction of total step wall time spent in steps that included at
+        # least one prefill token (pure_prefill or mixed), vs. pure_decode.
+        "pct_wall_time_prefill_or_mixed": (prefill_involved_time / total_step_time * 100)
+        if total_step_time else None,
         "e2e_latency_mean_s": (sum(completion_latency.values()) / len(completion_latency))
         if completion_latency
         else None,
@@ -291,6 +326,8 @@ def main():
             f"throughput={_fmt('measured_throughput_req_s')} req/s  "
             f"TTFT mean/p50/p99={_fmt('ttft_mean_ms')}/{_fmt('ttft_p50_ms')}/{_fmt('ttft_p99_ms')} ms  "
             f"decode/token={_fmt('decode_latency_mean_ms')} ms  "
+            f"prefill/step={_fmt('prefill_step_time_mean_ms')} ms  "
+            f"%time prefill-involved={_fmt('pct_wall_time_prefill_or_mixed')}%  "
             f"SM util={_fmt('gpu_sm_util_avg_pct')}"
         )
 
