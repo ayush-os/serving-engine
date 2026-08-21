@@ -157,7 +157,14 @@ def test_prefix_cache_matches_uncached():
     fail, use the same first-diverging-token logit diagnostic as the
     existing xfails above before assuming it's a real bug.
     """
-    SHARED_PROMPT = "In machine learning, a transformer is"  # long enough to clear one full 16-token block
+    # Needs to clear a full 16-token block for match_prefix to have anything
+    # to match -- "In machine learning, a transformer is" alone tokenizes to
+    # just 8 tokens (BOS + 7), nowhere near enough; this is comfortably over.
+    SHARED_PROMPT = (
+        "You are a helpful, honest, and concise assistant. Always answer "
+        "clearly and directly, without unnecessary padding. In machine "
+        "learning, a transformer is"
+    )
 
     uncached_engine = LLMEngine(num_gpu_blocks=1024)
     try:
