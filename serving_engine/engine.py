@@ -4,7 +4,7 @@ from typing import List
 from serving_engine.block import BLOCK_SIZE
 from serving_engine.block_manager import BlockManager
 from serving_engine.model_runner import ModelRunner
-from serving_engine.request import Request, RequestStatus
+from serving_engine.request import Request, RequestPhase, RequestStatus
 from serving_engine.scheduler import Scheduler
 
 
@@ -21,6 +21,7 @@ class LLMEngine:
         model_name: str = None,
         max_num_batched_tokens: int | None = None,
         max_num_seqs: int | None = None,
+        min_chunk_size: int | None = None,
     ):
         """num_gpu_blocks=None sizes the KV cache pool from actual free GPU
         memory (see ModelRunner._infer_num_gpu_blocks) instead of a fixed
@@ -35,7 +36,11 @@ class LLMEngine:
         in ModelRunner) doesn't account for -- an unbounded batch can OOM at
         high concurrency even with a correctly-sized KV pool. These caps are
         the real guard against that until the eager attention op itself
-        gets tiled (a bigger fix, deferred -- see handoff.md)."""
+        gets tiled (a bigger fix, deferred -- see handoff.md).
+
+        min_chunk_size: Phase 2.5's chunked-prefill floor -- see Scheduler.
+        None means no floor (any leftover budget, however small, still
+        admits a chunk)."""
         kwargs = {"model_name": model_name} if model_name else {}
         self.model_runner = ModelRunner(num_gpu_blocks, BLOCK_SIZE, **kwargs)
         self.block_manager = BlockManager(self.model_runner.num_gpu_blocks, BLOCK_SIZE)
@@ -43,6 +48,7 @@ class LLMEngine:
             self.block_manager,
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
+            min_chunk_size=min_chunk_size,
         )
         self.requests = {}
 
@@ -93,7 +99,11 @@ class LLMEngine:
         logits = self.model_runner.forward(scheduler_output)
         next_tokens = logits.argmax(dim=-1)
         for req, tok in zip(scheduler_output.scheduled_requests, next_tokens):
-            req.output_token_ids.append(tok.item())
+            if req.phase == RequestPhase.NEEDS_DECODE or req.request_id in scheduler_output.prefill_final_chunk:
+                req.output_token_ids.append(tok.item())
+            # else: NEEDS_PREFILL, not this request's last chunk -- this
+            # step's last-token logits are still mid-prompt, not a genuine
+            # next-token prediction, so there's nothing to sample yet.
         self.scheduler.update_after_step(scheduler_output)
         return scheduler_output
 

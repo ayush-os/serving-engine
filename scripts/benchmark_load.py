@@ -275,6 +275,12 @@ def main():
                               "Pass 0 to disable.")
     parser.add_argument("--max-output-len", type=int, default=256,
                          help="same clamp, for output length.")
+    parser.add_argument("--min-chunk-size", type=int, default=None,
+                         help="Phase 2.5 chunked-prefill floor (see Scheduler): a prefill chunk "
+                              "smaller than this is skipped this iteration unless it's the only "
+                              "candidate under consideration (same lone-candidate exception as "
+                              "--max-num-batched-tokens) or it's the request's actual final chunk. "
+                              "Default: no floor.")
     parser.add_argument("--no-dmon", action="store_true", help="skip nvidia-smi dmon sampling")
     parser.add_argument("--output", type=str, default="benchmark_results.csv")
     args = parser.parse_args()
@@ -286,12 +292,14 @@ def main():
         num_gpu_blocks=args.num_gpu_blocks,
         max_num_batched_tokens=args.max_num_batched_tokens or None,
         max_num_seqs=args.max_num_seqs or None,
+        min_chunk_size=args.min_chunk_size,
     )
     print(
         f"KV cache pool: {engine.model_runner.num_gpu_blocks} blocks "
         f"({engine.block_manager.get_num_free_blocks()} free)\n"
         f"Scheduler caps: max_num_batched_tokens={engine.scheduler.max_num_batched_tokens}, "
-        f"max_num_seqs={engine.scheduler.max_num_seqs}\n"
+        f"max_num_seqs={engine.scheduler.max_num_seqs}, "
+        f"min_chunk_size={engine.scheduler.min_chunk_size}\n"
         f"Workload length caps: max_prompt_len={args.max_prompt_len or None}, "
         f"max_output_len={args.max_output_len or None}\n"
     )
