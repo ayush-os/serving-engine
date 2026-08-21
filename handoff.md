@@ -966,6 +966,20 @@ time budget, and why prefix-sharing — not TP or disaggregation — is the
 one candidate for a fast second phase if Phase 4 finishes with room to
 spare.
 
+**Re-confirmed directly with the user after prefix-caching shipped**:
+asked point-blank which of Phase 3 (TP) / Phase 4 (kernel) / Phase 5
+(disaggregation) to do next, learning-vs-time-wise. Same answer as the
+ranking above, for the same reasons — Phase 4 stays the pick: TP has the
+lowest marginal learning value here (real prior from-scratch ZeRO/FSDP/DDP
+experience already makes its core mechanism conceptually adjacent, despite
+sounding like the flashier "Anthropic/OpenAI-scale" story) and disaggregation
+has the highest novelty *and* highest time/infra cost (the reach goal, not
+the next pick). Phase 4 wins on the actual ratio: bounded (extends existing
+kernel work, not from scratch) and directly motivated by real data already
+in hand (Phase 2.5's `max_num_seqs` finding). **Greenlit to start — this
+isn't an open question in a fresh session, just execute "Immediate next
+steps" below.**
+
 ## Immediate next steps — Phase 4 (real paged-attention kernel)
 
 **What it is** (per spec.md's Phase 4 section, unchanged there): replace
