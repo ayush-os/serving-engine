@@ -220,3 +220,33 @@ def test_prefix_cache_matches_uncached():
         torch.cuda.empty_cache()
 
     assert actual == expected
+
+
+@pytest.mark.parametrize("prompt", PROMPTS)
+def test_triton_kernel_matches_eager(prompt):
+    """Phase 4 checkpoint: the paged Triton kernel (ModelRunner's default
+    attn_implementation) must produce identical output to this engine's own
+    dense eager-attention path on identical prompts. Compared against the
+    engine's own eager path, not HF .generate(), same methodology as
+    test_chunked_prefill_matches_one_shot/test_prefix_cache_matches_uncached
+    above -- isolates any divergence to the new kernel itself rather than
+    conflating it with the separate bf16-vs-HF decode drift those tests'
+    xfails are about.
+    """
+    eager_engine = LLMEngine(num_gpu_blocks=1024, attn_implementation="paged|eager")
+    try:
+        [expected] = eager_engine.generate([prompt], max_new_tokens=MAX_NEW_TOKENS)
+    finally:
+        del eager_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    triton_engine = LLMEngine(num_gpu_blocks=1024)
+    try:
+        [actual] = triton_engine.generate([prompt], max_new_tokens=MAX_NEW_TOKENS)
+    finally:
+        del triton_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    assert actual == expected
