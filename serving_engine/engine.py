@@ -22,6 +22,7 @@ class LLMEngine:
         max_num_batched_tokens: int | None = None,
         max_num_seqs: int | None = None,
         min_chunk_size: int | None = None,
+        attn_implementation: str | None = None,
     ):
         """num_gpu_blocks=None sizes the KV cache pool from actual free GPU
         memory (see ModelRunner._infer_num_gpu_blocks) instead of a fixed
@@ -29,19 +30,26 @@ class LLMEngine:
 
         max_num_batched_tokens/max_num_seqs were built and unit-tested in
         Scheduler but never threaded through here -- nothing in Phase 1 ran
-        a batch wide enough to need them. They matter now: the eager (not
-        flash) paged-attention op materializes one dense [total_query,
-        total_read] score matrix across the WHOLE scheduled batch, which
-        the fixed startup activation-memory headroom (gpu_memory_utilization
-        in ModelRunner) doesn't account for -- an unbounded batch can OOM at
-        high concurrency even with a correctly-sized KV pool. These caps are
-        the real guard against that until the eager attention op itself
-        gets tiled (a bigger fix, deferred -- see handoff.md).
+        a batch wide enough to need them. They matter now regardless of
+        attn_implementation: the fixed startup activation-memory headroom
+        (gpu_memory_utilization in ModelRunner) doesn't account for an
+        unbounded batch, so these caps are still the real memory guard even
+        with a correctly-sized KV pool. The eager path (attn_implementation=
+        "paged|eager") additionally materializes one dense [total_query,
+        total_read] score matrix across the WHOLE scheduled batch on top of
+        that -- Phase 4's tiled Triton kernel (the default) is what avoids
+        this, see handoff.md.
 
         min_chunk_size: Phase 2.5's chunked-prefill floor -- see Scheduler.
         None means no floor (any leftover budget, however small, still
-        admits a chunk)."""
+        admits a chunk).
+
+        attn_implementation: None uses ModelRunner's default (the Phase 4
+        triton kernel); pass "paged|eager" to compare against the dense
+        HF-builtin path (see tests/test_correctness.py's oracle test)."""
         kwargs = {"model_name": model_name} if model_name else {}
+        if attn_implementation:
+            kwargs["attn_implementation"] = attn_implementation
         self.model_runner = ModelRunner(num_gpu_blocks, BLOCK_SIZE, **kwargs)
         self.block_manager = BlockManager(self.model_runner.num_gpu_blocks, BLOCK_SIZE)
         self.scheduler = Scheduler(
