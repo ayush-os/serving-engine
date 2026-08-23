@@ -1,4 +1,4 @@
-# Handoff — serving-engine, Phase 1+2+2.5+prefix-caching complete, Phase 4 (paged-attention kernel) next
+# Handoff — serving-engine, Phase 1+2+2.5+prefix-caching+Phase 4 (paged-attention kernel) complete
 
 Written so a fresh chat session (or future you) can pick up exactly where
 this one left off, without re-deriving anything already settled. Read
@@ -37,14 +37,19 @@ session" below) — GPU-correctness-verified (1 real `xfail`, same
 bf16/kernel-non-determinism class as every prior precedent, root-caused
 via a dedicated diagnostic script) and benchmarked at a real 1.53x
 wall-clock speedup on a shared-system-prompt-style workload. **Phase 4
-(real paged-attention kernel) is next**, directly motivated by Phase 2.5's
-own finding: it pinned the saturation-ceiling bottleneck down to
-admission-queue depth (`max_num_seqs`, a defensive cap against the eager
-attention op's unbounded memory scaling), which neither chunking nor
-prefix-caching touch but a tiled kernel plausibly can. See "Roadmap after
-Phase 2" and "Immediate next steps — Phase 4" at the bottom (both still
-accurate — prefix-caching's insertion ahead of Phase 4 was a scheduling
-change, not a re-ranking of Phase 4's own motivation).
+(real paged-attention kernel)**: also done, see "Sixth GPU session" below.
+Kernel-body writing (causal-mask offset, ragged-tile boundary checks) was
+the user's own hands-on work per Decision 3's pedagogical framing, with
+Claude scaffolding/reviewing/integrating around it. GPU-correctness-
+verified against the eager path (2/3 exact matches, the third
+independently diagnosed as the same bf16/kernel-non-determinism class as
+every prior precedent) and benchmarked with real, non-trivial results:
+the kernel swap itself was the dominant effect (throughput +30-40%, TTFT
+at saturation roughly halved, at unchanged `max_num_seqs=16`); pushing
+`max_num_seqs` further gave a smaller secondary gain; pushing
+`max_num_batched_tokens` moved the ceiling more but traded TTFT for
+throughput — a real tradeoff, not smoothed over. Net vs. the original
+eager baseline: throughput +89-94%, TTFT at saturation -43% to -48%.
 
 ## First GPU session — model swap, real bugs found, correctness result
 
@@ -837,6 +842,143 @@ wall-clock: **2.42s (shared) vs 3.70s (unshared control, same request
 count/shape, distinct prefixes) — a 1.53x speedup**, purely from skipping
 redundant prefill compute across concurrently-alive requests.
 
+## Sixth GPU session — Phase 4 (paged Triton kernel): kernel correctness, real benchmark results, and a real throughput/latency tradeoff
+
+**Division of labor, a real exception to the pattern described below**:
+unlike every prior phase, the kernel *body* itself (`paged_flash_fwd_
+kernel`'s causal-mask/boundary logic in `paged_attention_kernel.py`) was
+the user's own hands-on work, not Claude's — spec.md's Decision 3 reuses
+the existing hand-written FlashAttention-2 kernel specifically so this
+phase doesn't re-derive online-softmax from scratch, but the actual
+paging/GQA/variable-length *extension* is the real pedagogical point of
+Phase 4 and stayed the user's to write. Claude's role was scaffolding
+(file setup, `# TODO(you)` markers), Socratic review (not direct fixes)
+on the kernel body specifically, and everything *around* it — the launch
+wrapper, `build_paged_batch_metadata`, the `model_runner.py`/HF
+integration, tests, benchmarking, this writeup — directly, same as every
+other phase.
+
+**Design, briefly** (see `paged_attention_kernel.py`): one kernel handles
+both prefill chunks and decode, not two separate kernels or a decode-only
+first cut (a real scope fork surfaced going in, resolved toward the full
+version once reading `model_runner.py` showed prefill/decode already
+share one flattened `forward()` call) — grid dim 1 (`row_index`) indexes
+per-row `q_lens`/`k_lens`/`block_table` arrays built by
+`build_paged_batch_metadata`, so a decode row (`n_queries=1`) and a
+prefill-chunk row (`n_queries=chunk_size`) run the identical kernel code
+path.
+
+**Two real bugs caught in review, fixed by the user directly** (matching
+the division-of-labor note above):
+- Causal mask used tile-relative `q_idx` (`query_tile_index * Q_TILE_SIZE
+  + tl.arange(...)`) with no per-row offset — wrong for anything but a
+  fresh request's first tile, since a prefill chunk's true logical
+  position starts at `num_computed_tokens` and a decode row's true
+  position is `total_len - 1`, not 0. Fixed with a new per-row
+  `q_pos_offset_ptr` array (`build_paged_batch_metadata` computes it:
+  `num_computed_tokens` for prefill, `total_len - 1` for decode).
+- No `boundary_check` on the ragged-tile loads/stores. Every decode row
+  has `n_queries=1` against `Q_TILE_SIZE=16` — not an edge case, the
+  common case — so without `boundary_check=(0,)` on the `Q`/`K`/`V` loads
+  and `O`/`L` stores, every decode step would read/write out of the
+  block pointer's declared `shape`. The existing causal mask already
+  handles the padded-key side for free (`q_idx` never exceeds `n_keys -
+  1`, so any padded `k_idx >= n_keys` already fails `q_idx >= k_idx`
+  regardless of what garbage sits in the padding) — the fix only needed
+  adding the boundary-check kwarg, no new masking logic.
+
+**Environment note, matches the Fourth GPU session's box exactly**: 80GB
+A100, driver 535.129.03, CUDA 12.2 — cu121 wheel confirmed working again,
+same as before. One new environment bug, not code: bare `pytest` (the
+installed console script) doesn't put the repo root on `sys.path` the way
+`python -m pytest` does, and `tests/` has no `__init__.py` — first run hit
+`ModuleNotFoundError: No module named 'serving_engine'` even though it's a
+real package. `python -m pytest` unblocks immediately; `pytest.ini`
+(`pythonpath = .`) fixes it permanently for bare `pytest` too, added this
+session.
+
+**Correctness**: `test_triton_kernel_matches_eager` (new) — 2/3 prompts
+match the eager path exactly on first run. The fibonacci case diverges at
+output token 2; given its own dedicated diagnostic
+(`scripts/diagnose_triton_kernel_divergence.py`, same raw-logits-at-
+first-divergence methodology as every precedent) rather than silently
+inheriting `PROMPTS`' shared marker (written for a different comparison,
+engine-vs-HF) — near-tied argmax (4304 vs 422, both ~19.5), identical
+top-5 set `{4304, 422, 16178, 3270, 674}` just reordered, max abs diff
+0.2188. Same expected bf16/kernel-reduction-order-noise signature as
+every other xfail in this file, now between two attention
+implementations (eager vs. triton) instead of engine-vs-HF or
+batch-composition differences. Confirmed, not assumed: diverges
+mid-decode, not at prefill, and neither a large logit gap nor a
+non-overlapping top-5 shows up.
+
+### The real benchmark — three configs, and the original hypothesis was half right
+
+Same apples-to-apples discipline as every prior benchmark rerun: identical
+`scripts/benchmark_load.py` config to `benchmark_results_final.csv`
+(`--max-num-batched-tokens 1024 --max-num-seqs 16 --max-prompt-len 2048
+--max-output-len 512`, `--rates 0.5,...,32`) as the first triton run,
+kernel swapped in with nothing else changed — then two further single-
+variable steps (`--max-num-seqs 32`, then `--max-num-batched-tokens 2048`
+on top of that), each isolating one knob.
+
+| config | throughput plateau (req/s) | TTFT @ rate=16 | TTFT @ rate=32 |
+|---|---|---|---|
+| eager, seqs=16/tokens=1024 (baseline) | ~2.0–2.17 | 61.9s | 143.3s |
+| triton, seqs=16/tokens=1024 | ~2.79–2.82 | 32.4s | 80.1s |
+| triton, seqs=32/tokens=1024 | ~2.9–3.0 | 26.3s | 70.0s |
+| triton, seqs=32/tokens=2048 | ~3.9–4.1 | 32.3s | 81.9s |
+
+**The "Immediate next steps" prediction below — raising `max_num_seqs`
+would reduce TTFT at saturation — was right, but not for the reason it
+led with**:
+
+- **The kernel swap itself, not `max_num_seqs`, is the dominant effect.**
+  Same `max_num_seqs=16` in row 2 as the eager baseline in row 1:
+  `prefill_step_time_mean_ms` and `mixed_step_time_mean_ms` roughly
+  halved at every saturated rate (e.g. 221ms→107ms, 178ms→98ms at
+  rate=32) — direct confirmation the paged kernel avoids eager's wasted
+  compute on the dense `[total_query, total_read]` score matrix's
+  masked-out cross-request pairs. Throughput ceiling jumped ~30-40% and
+  TTFT at saturation roughly halved from *that alone*.
+- **Raising `max_num_seqs` (16→32, `tokens` still 1024) gave a real but
+  secondary win**: throughput +~6-9%, TTFT at saturation -13% to -19%.
+  Smaller than the kernel-swap effect, and `mixed_step_time_mean_ms`
+  actually *rose* going from seqs=16 to seqs=32 (98ms→151ms at rate=32,
+  token budget unchanged) — plausibly more concurrent decode rows adding
+  per-row kernel-launch overhead (`row_index` is the grid's second axis;
+  more admitted sequences means more rows per step regardless of total
+  token count), not independently profiled further to confirm.
+- **`max_num_batched_tokens`, not `max_num_seqs`, turned out to be the
+  real remaining bottleneck** — the one genuinely unpredicted finding.
+  Raising it 1024→2048 (seqs held at 32) moved the throughput ceiling
+  much further (~2.9-3.0 → ~3.9-4.1 req/s, +33-37%) than raising
+  `max_num_seqs` alone did. Confirms per-step *token budget*, not
+  admitted-sequence *count*, was the binding constraint once the kernel
+  itself was no longer the bottleneck.
+- **But that came with a real, not-smoothed-over tradeoff: TTFT at
+  saturation got *worse*, not better** (26.3s→32.3s at rate=16;
+  70.0s→81.9s at rate=32), because `prefill_step_time_mean_ms`/
+  `mixed_step_time_mean_ms` roughly doubled too (~107ms→~220-234ms,
+  ~93-151ms→~205-209ms) — a bigger per-step token budget means more raw
+  compute per step, so any individual step takes longer, and a request's
+  own prefill work is more likely to land inside one of those longer
+  steps. Ordinary batching throughput/latency tradeoff, not a bug and not
+  a refutation — a second real finding stacked on the first, deliberately
+  reported as-is rather than only reporting the config that looks best.
+
+**Net, against the actual starting point** (not just the intermediate
+triton configs): at rate=16, throughput 2.11→4.10 req/s (+94%), TTFT
+61.9s→32.3s (-48%); at rate=32, 2.10→3.96 req/s (+89%), 143.3s→81.9s
+(-43%). A decisive real win overall, with a more specific and more
+interesting mechanism than the original one-sentence hypothesis — same
+"disagreement is a more interesting finding than agreement" pattern as
+Phase 2's own prefill-vs-decode result and Phase 2.5's chunking result
+above: the predicted direction was right, the dominant cause (kernel
+efficiency, not admission-queue depth alone) and the tradeoff surfaced by
+pushing further (`max_num_batched_tokens` trading latency for throughput)
+were not what the original framing led with.
+
 ## Deliberately deferred — not bugs, don't "fix" these reflexively
 
 - **`block_manager.py`: `append_slot`'s CoW branch** — resolved, not just
@@ -909,19 +1051,13 @@ it, not duplicated in full here).
    queue depth (`max_num_seqs`), not prefill-step granularity — which is
    exactly what makes Phase 4 (next) a data-motivated pick, not a
    speculative one.
-2. **Phase 4 (real paged-attention kernel)** — now the top priority, and
-   more directly motivated than it was before Phase 2.5's data landed:
-   fixes the actual eager-attention memory-scaling problem behind Bugs 1
-   and 3 (Third GPU session) *and* is now the plausible fix for the exact
-   thing Phase 2.5 showed governs TTFT at saturation (a tiled kernel's
-   small, predictable memory footprint could let `max_num_seqs` rise
-   without the same OOM risk, directly shrinking admission-queue depth).
-   Extends the existing Triton FlashAttention-2 kernel (not from scratch
-   — spec.md's Decision 3 explicitly guards against re-proving
-   kernel-writing ability) into a genuinely different technique
-   (block-sparse gather-index vs. dense). Strong fit for the Kernel/ML
-   Performance Engineer secondary target and MatX's accelerator-codesign
-   focus. See "Immediate next steps — Phase 4" below.
+2. ~~**Phase 4 (real paged-attention kernel)**~~ — **done**, see "Sixth
+   GPU session" above. Real result matched the predicted direction better
+   than Phase 2.5's own chunking hypothesis did, but the dominant cause
+   was more specific than the original framing: the kernel swap itself
+   (not `max_num_seqs`) drove most of the gain, and pushing
+   `max_num_batched_tokens` further surfaced a genuine latency/throughput
+   tradeoff the original framing didn't anticipate.
 3. **Phase 3 (real tensor parallelism)** — spec.md's own first-priority
    stretch, most direct "Anthropic/OpenAI-scale inference" story, but the
    most expensive (multi-GPU rental, distributed correctness debugging)
@@ -980,87 +1116,33 @@ in hand (Phase 2.5's `max_num_seqs` finding). **Greenlit to start — this
 isn't an open question in a fresh session, just execute "Immediate next
 steps" below.**
 
-## Immediate next steps — Phase 4 (real paged-attention kernel)
+## Phase 4 — done, see "Sixth GPU session" above
 
-**What it is** (per spec.md's Phase 4 section, unchanged there): replace
-the gather-then-dense MVP attention path with a real block-sparse kernel
-that reads directly from non-contiguous cache blocks — extend the
-existing Triton FlashAttention-2 kernel (**lives elsewhere in the user's
-portfolio, not in this repo — locate and re-familiarize with it before
-designing the integration**, spec.md's Decision 3 explicitly guards
-against rebuilding kernel-writing ability from scratch) to take a block
-table and gather-index *inside* the kernel, rather than gathering into a
-contiguous buffer beforehand the way `_PagedKVCache.update()` does today.
-
-**Why now, concretely, more specific than spec.md's original framing**:
-Phase 2.5's real data (see "Fourth GPU session" above) pinned the
-saturation bottleneck down to admission-queue depth — `max_num_seqs`
-exists specifically as a defensive cap against the eager attention op's
-unbounded, batch-composition-dependent memory scaling (Third GPU
-session's Bugs 1 and 3: `eager_paged_attention_forward` materializes one
-dense `[total_query, total_read]` score matrix in HBM across the *whole*
-scheduled batch, and `ModelRunner._infer_num_gpu_blocks` reserves a fixed
-activation-memory headroom once at startup with no idea how wide/deep a
-real batch gets). A tiled kernel that never materializes the full matrix
-has a small, predictable memory footprint regardless of batch composition
-— the plausible, direct mechanism to raise `max_num_seqs` safely, which
-is the thing Phase 2.5 just showed actually governs TTFT at saturation.
-
-**Current integration point** (`model_runner.py`, read this again before
-starting): `self.model.set_attn_implementation("paged|eager")` registers
-`eager_paged_attention_forward` via `ALL_ATTENTION_FUNCTIONS`; it reads a
-`cache` kwarg and calls `cache.update(key_states, value_states, layer_idx,
-read_index, write_index)`. `_PagedKVCache.update()` (top of the file) is
-the small duck-typed class actually doing the gather/scatter today —
-`index_copy_`/`index_select` into/out of a flattened per-layer view of
-`self.kv_cache`, then a plain dense matmul over the gathered buffer. Phase
-4's kernel replaces that dense-matmul-over-a-gathered-buffer step with a
-real block-sparse kernel that gathers per-tile *inside* the kernel itself.
-
-**Real design forks to surface explicitly, not silently resolve** (same
-discipline as every `🧠` decision so far):
-- Scope: does the kernel need to handle this engine's full heterogeneous
-  batch shape (mixed prefill chunks + decode + multiple concurrent
-  requests, per-request causal masking) from the start, or is it worth
-  starting narrower — e.g. decode-only tiled attention first, since
-  decode-driven concurrency depth (many long-context requests) is what
-  actually forced `max_num_seqs` down in Bug 3, and prefill's now
-  partially mitigated by chunking — then extending to prefill/mixed
-  batches once that's working? A real scope decision, not a default.
-- How the kernel takes the block table: gather-index computed once in
-  Python and passed in (closer to today's `read_idxes`/`write_idxes`), or
-  computed inside the kernel from `block_table` directly? Affects how
-  much of `_flat_slot`'s logic moves into the kernel itself.
-- Whether `_PagedKVCache` stays as the integration shim (kernel called
-  from inside `.update()`) or the attention-function registration
-  (`set_attn_implementation`) needs to point at something new entirely.
-
-**Correctness oracle**: token-for-token match against the current
-eager/dense attention path on identical prompts, same pattern as every
-correctness checkpoint in this project so far (Phase 1's HF comparison,
-Phase 2.5's chunked-vs-one-shot comparison) — the kernel must change
-*how* attention gets computed, not *what* gets generated.
-
-**Real measurement, the actual checkpoint, more specific than spec.md's
-original "measure the real speedup"**: with the new kernel's smaller,
-predictable memory footprint, does raising `max_num_seqs` (and re-running
-`scripts/benchmark_load.py` with the same `--rates 0.5,1,2,4,8,16,32`
-sweep used for `benchmark_results_final.csv`/`benchmark_results_chunked.
-csv`) actually reduce TTFT at saturation? That's the real, data-motivated
-question Phase 2.5 set up — not just "is the kernel faster in isolation."
-A genuine before/after against both existing CSVs, not a fresh,
-incomparable run.
-
-**Division of labor**: same pattern as every phase so far — design forks
-above get surfaced and decided together, then implementation of the
-resolved result is Claude's to do directly.
+This section used to be "Immediate next steps — Phase 4"; kept as a short
+pointer rather than deleted outright, since the design forks it raised
+going in are worth recording how they actually resolved:
+- **Scope**: resolved toward the full version, not decode-only-first —
+  reading `model_runner.py` showed prefill chunks and decode already
+  share one flattened `forward()` call, so one kernel handling both via
+  per-row `q_lens`/`k_lens` (a decode row is just `n_queries=1`) was the
+  natural fit, not extra scope.
+- **Gather-index**: computed once in Python (`build_paged_batch_metadata`,
+  called once per step, not per layer) and passed in as per-row arrays —
+  closer to the existing `read_idxes`/`write_idxes` pattern than moving
+  `_flat_slot`'s logic into the kernel itself.
+- **`_PagedKVCache`**: stayed the integration shim, but split into
+  `write()` (scatter, shared by both attention paths) and `blocks()` (raw
+  block-structured read, triton-only) — reusing `update()`'s existing
+  `index_select`-based gather for the new path would have defeated the
+  entire point of a paged kernel, see "Sixth GPU session" above for the
+  full reasoning.
 
 Phase 2's own report/writeup (the predicted-vs-real section spec.md's
 Phase 2 originally called for) is still open — explicitly not a
 Claude-authored writeup per the established division of labor (see "How
 this session worked"), deferred behind Phase 2.5 at the user's own
-request. Phase 2.5 is now done too, so this is still open and still not
-forgotten, just now behind Phase 4 as well.
+request, then behind Phase 4 too. Both are done now; still open, still
+not forgotten.
 
 ## How this session worked, for continuity
 
