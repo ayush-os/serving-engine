@@ -326,6 +326,27 @@ likely to finish cleanly — spec.md's own Fallback logic already says a
 complete phase beats a half-built one, which matters more with no next
 phase to fall back to.
 
+**Real data landed** (see `handoff.md`'s "Sixth GPU session" for the full
+story): the "raising `max_num_seqs` post-kernel reduces TTFT at
+saturation" prediction above was directionally right but not for the
+reason it led with. The kernel swap itself, at *unchanged*
+`max_num_seqs=16`, was the dominant effect (throughput +30-40%, TTFT at
+saturation roughly halved) — direct confirmation the paged kernel avoids
+eager attention's wasted compute on its dense score matrix's masked-out
+cross-request pairs. Raising `max_num_seqs` further (16→32) gave a real
+but secondary gain (+~6-9% throughput, -13-19% TTFT). The genuinely
+unpredicted finding: `max_num_batched_tokens`, not `max_num_seqs`, turned
+out to be the real remaining bottleneck — raising it moved the throughput
+ceiling much further (~2.9-3.0 → ~3.9-4.1 req/s) but traded TTFT for
+throughput (saturation TTFT got *worse*, not better), an ordinary
+batching latency/throughput tradeoff surfaced by pushing past the
+original hypothesis rather than a refutation of it. Net vs. the original
+eager baseline: throughput +89-94%, TTFT at saturation -43% to -48%.
+Correctness: GPU-verified, 2/3 prompts match the eager path exactly, the
+third independently diagnosed as the same bf16/kernel-non-determinism
+class as every prior xfail in this project (same discipline as Phase 1's
+own HF-comparison xfail and Phase 2.5's own precedent above).
+
 ---
 
 ## Phase 5 — Stretch: disaggregated prefill/decode (🧠, the reach goal, only with time to spare)
@@ -380,16 +401,14 @@ the full reasoning across time cost, learning/time ratio, novelty vs.
 skills already demonstrated elsewhere in the portfolio, and target-company
 fit): ~~**Phase 2.5 (chunked prefill)** first~~ — **done**, see Phase
 2.5's "Real data landed" note above and `handoff.md`'s "Fourth GPU
-session." **Phase 4 (real paged-attention kernel)** is now the top
-priority — more directly motivated than before, since Phase 2.5's own
-data pinned the saturation-latency bottleneck down to admission-queue
-depth (`max_num_seqs`), a resource a tiled kernel could plausibly free up
-and chunking structurally can't touch (see Phase 4's section above).
-**Phase 3 (real tensor parallelism)** still third — still valuable, the
-most direct "Anthropic/OpenAI-scale inference" story, but the most
-expensive and the lowest incremental learning ratio given existing real
-ZeRO/FSDP/DDP experience, and (per the user, since Phase 4 is likely the
-last phase attempted) the real finish-risk of a multi-GPU/distributed
+session." ~~**Phase 4 (real paged-attention kernel)**~~ — **done**, see
+Phase 4's "Real data landed" note above and `handoff.md`'s "Sixth GPU
+session." **Phase 3 (real tensor parallelism)** is next in line if
+pursued further — still valuable, the most direct "Anthropic/OpenAI-scale
+inference" story, but the most expensive and the lowest incremental
+learning ratio given existing real ZeRO/FSDP/DDP experience, and (per the
+user, decided when Phase 4 looked likely to be the last phase attempted)
+the real finish-risk of a multi-GPU/distributed
 debugging phase matters more now with no next phase to fall back to.
 ~~**Prefix-sharing / finishing `fork()`**~~ — **done**, out of the order
 above: pulled ahead of Phase 4 on a live mid-session call (bounded scope,
