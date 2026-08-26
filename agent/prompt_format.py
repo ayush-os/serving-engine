@@ -17,9 +17,18 @@ TOOL_CALL_RE = re.compile(r"<function=(\w+)>(\{.*?\})</function>", re.DOTALL)
 
 
 def build_prompt_ids(tokenizer, messages, tools):
-    return tokenizer.apply_chat_template(
+    """Returns a flat List[int], regardless of which shape this transformers
+    version's apply_chat_template hands back -- observed in practice to be a
+    BatchEncoding (not the plain List[int] the docs describe) once `tools`
+    is passed, so this normalizes rather than trusting one shape."""
+    encoded = tokenizer.apply_chat_template(
         messages, tools=tools, add_generation_prompt=True,
     )
+    if hasattr(encoded, "input_ids"):
+        encoded = encoded.input_ids
+    if encoded and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    return list(encoded)
 
 
 def parse_tool_call(text: str):

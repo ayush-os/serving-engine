@@ -4,8 +4,25 @@ need real model/CUDA (parsing, tool execution). The loop/engine-driving
 parts need a real model and are exercised instead by
 scripts/run_agent_sanity_check.py.
 """
-from agent.prompt_format import parse_tool_call
+from agent.prompt_format import build_prompt_ids, parse_tool_call
 from agent.tools import execute_code, search_docs
+
+
+class _FakeTokenizer:
+    """Stubs the three response shapes apply_chat_template has been
+    observed to return across transformers versions/args, so
+    build_prompt_ids's normalization is testable without a real model."""
+
+    def __init__(self, to_return):
+        self._to_return = to_return
+
+    def apply_chat_template(self, messages, tools, add_generation_prompt):
+        return self._to_return
+
+
+class _FakeBatchEncoding:
+    def __init__(self, input_ids):
+        self.input_ids = input_ids
 
 
 def test_parse_tool_call_extracts_name_and_args():
@@ -39,3 +56,18 @@ def test_search_docs_finds_real_content_in_repo():
     assert "no matches" not in result
     first_line = result.splitlines()[0]
     assert first_line.startswith("From ") and ".md" in first_line
+
+
+def test_build_prompt_ids_unwraps_plain_list():
+    tokenizer = _FakeTokenizer([1, 2, 3])
+    assert build_prompt_ids(tokenizer, [], []) == [1, 2, 3]
+
+
+def test_build_prompt_ids_unwraps_batched_list():
+    tokenizer = _FakeTokenizer([[1, 2, 3]])
+    assert build_prompt_ids(tokenizer, [], []) == [1, 2, 3]
+
+
+def test_build_prompt_ids_unwraps_batch_encoding():
+    tokenizer = _FakeTokenizer(_FakeBatchEncoding([1, 2, 3]))
+    assert build_prompt_ids(tokenizer, [], []) == [1, 2, 3]
