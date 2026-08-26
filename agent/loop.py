@@ -2,17 +2,16 @@
 1) -- parse a tool call from the model's output, execute it, append the
 result, repeat until a final answer or TURN_CAP is hit.
 
-Design note on stopping: the base engine's Request only supports a single
-`eos_token_id` (see serving_engine/request.py + scheduler.py's stop check),
-which resolves to the tokenizer's one default eos token -- normally
-`<|eot_id|>` (final-answer turns stop cleanly). A tool-call turn instead
-ends in `<|eom_id|>`, which isn't that stop id, so generation runs to
-max_new_tokens and produces a degenerate tail after the function tag
-closes. Rather than touching the base engine's stop logic to support a set
-of stop ids (out of scope for this project -- see spec's own scope note),
-this is handled agent-side: parse_tool_call finds the first well-formed
-`<function=...>` tag and everything after it is discarded, so the wasted
-tail costs some decode compute but never reaches conversation history.
+Design note on stopping: this template's `eos_token_id` correctly resolves
+to `<|eot_id|>` (confirmed on-box), but the model doesn't reliably emit it
+right after a tool call -- observed rambling into a hallucinated second
+turn instead of stopping (see prompt_format.py's docstring: this template
+has no distinct "tool call, more to come" token to rely on either). Rather
+than touching the base engine's single-`eos_token_id` stop logic (out of
+scope -- see spec's own scope note), this is handled agent-side:
+parse_tool_call finds the first well-formed JSON call and everything
+generated after it is discarded, so a runaway tail costs some wasted
+decode compute but never reaches conversation history.
 """
 from agent.prompt_format import build_prompt_ids, parse_tool_call
 from agent.tools import TOOLS, TOOLS_BY_NAME
@@ -44,8 +43,7 @@ class AgentSession:
                 self.messages.append({"role": "assistant", "content": final_text})
                 return final_text
 
-            name, args = tool_call
-            call_end = raw_text.index("</function>") + len("</function>")
+            name, args, call_end = tool_call
             self.messages.append({"role": "assistant", "content": raw_text[:call_end]})
 
             tool_fn = TOOLS_BY_NAME.get(name)

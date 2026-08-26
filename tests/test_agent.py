@@ -25,10 +25,23 @@ class _FakeBatchEncoding:
         self.input_ids = input_ids
 
 
-def test_parse_tool_call_extracts_name_and_args():
-    text = 'Sure, let me check.<function=search_docs>{"query": "prefix caching"}</function>'
-    result = parse_tool_call(text)
-    assert result == ("search_docs", {"query": "prefix caching"})
+def test_parse_tool_call_extracts_name_args_and_end_index():
+    text = '{"name": "search_docs", "parameters": {"query": "prefix caching"}} extra text'
+    name, args, end = parse_tool_call(text)
+    assert (name, args) == ("search_docs", {"query": "prefix caching"})
+    assert text[:end] == '{"name": "search_docs", "parameters": {"query": "prefix caching"}}'
+
+
+def test_parse_tool_call_ignores_rambling_after_the_call():
+    """Real failure mode seen on-box: the model doesn't reliably stop after
+    a tool call and rambles on, sometimes re-emitting further bogus calls.
+    Only the first well-formed call should be returned."""
+    text = (
+        '{"name": "search_docs", "parameters": {"query": "x"}}; '
+        '{"name": "execute_code", "parameters": {"code": "print(0.5)"}}'
+    )
+    name, args, _ = parse_tool_call(text)
+    assert (name, args) == ("search_docs", {"query": "x"})
 
 
 def test_parse_tool_call_returns_none_for_plain_text():
@@ -36,8 +49,12 @@ def test_parse_tool_call_returns_none_for_plain_text():
 
 
 def test_parse_tool_call_returns_none_for_malformed_json():
-    text = "<function=search_docs>{not valid json}</function>"
+    text = "{not valid json}"
     assert parse_tool_call(text) is None
+
+
+def test_parse_tool_call_ignores_json_without_expected_keys():
+    assert parse_tool_call('{"foo": "bar"}') is None
 
 
 def test_execute_code_captures_stdout():

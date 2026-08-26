@@ -1,19 +1,18 @@
-"""Llama 3.1 native tool-calling format (spec-agent-pcie.md Phase 0 reading).
+"""Tool-calling prompt format for this environment's Llama 3.1 chat
+template (spec-agent-pcie.md Phase 0 reading).
 
-Built via HF's chat template rather than hand-rolled -- transformers>=4.43
-already implements Llama 3.1's exact tool-calling conventions from a plain
-list of typed Python functions (it derives each tool's JSON schema from
-type hints + a Google-style "Args:" docstring). Custom (non-built-in)
-tools are emitted by the model as `<function=name>{json args}</function>`,
-followed by `<|eom_id|>` if more turns are expected or `<|eot_id|>` if the
-model considers this a final answer -- see agent/loop.py for why this
-module only checks for the `<function=...>` tag rather than relying on
-that token distinction.
+Built via HF's chat template rather than hand-rolled -- transformers
+derives each tool's JSON schema from a typed Python function's signature
+and Google-style "Args:" docstring. Real finding from the first GPU run,
+correcting the Phase 0 assumption: Meta's own docs describe custom tool
+calls as `<function=name>{json}</function>`, but the chat_template bundled
+with this specific tokenizer checkout instead glues the tool schema into
+the user turn and instructs a bare-JSON reply, `{"name": ..., "parameters":
+{...}}`, with no distinct end-of-call token (no `<|eom_id|>` in this
+template at all -- see agent/loop.py for why parsing truncates at the
+JSON's own closing brace rather than a special token).
 """
 import json
-import re
-
-TOOL_CALL_RE = re.compile(r"<function=(\w+)>(\{.*?\})</function>", re.DOTALL)
 
 
 def build_prompt_ids(tokenizer, messages, tools):
@@ -32,15 +31,27 @@ def build_prompt_ids(tokenizer, messages, tools):
 
 
 def parse_tool_call(text: str):
-    """Returns (name, args_dict) if `text` contains a well-formed custom
-    tool call, else None -- meaning the caller should treat `text` as the
-    agent's final answer instead."""
-    match = TOOL_CALL_RE.search(text)
-    if match is None:
-        return None
-    name, raw_args = match.groups()
-    try:
-        args = json.loads(raw_args)
-    except json.JSONDecodeError:
-        return None
-    return name, args
+    """Returns (name, args_dict, end_index) if `text` contains a
+    well-formed {"name": ..., "parameters": {...}} tool call, else None --
+    meaning the caller should treat `text` as the agent's final answer
+    instead. end_index is text's offset immediately after the JSON object,
+    so callers can discard anything generated after it (this template
+    gives no distinct stop signal for "tool call, more to come" -- the
+    model sometimes keeps rambling, even hallucinating a further turn).
+
+    Uses JSONDecoder.raw_decode rather than a regex: the JSON is
+    unbounded/nested (parameters can be any shape), so a regex can't
+    reliably find its true closing brace.
+    """
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict) and "name" in obj and "parameters" in obj:
+            return obj["name"], obj["parameters"], end
+        idx = text.find("{", idx + 1)
+    return None
