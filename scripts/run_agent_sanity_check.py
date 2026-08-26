@@ -30,9 +30,9 @@ def main():
     driver.start()
 
     try:
-        for task in TASKS:
+        for i, task in enumerate(TASKS):
             print(f"\n=== TASK: {task} ===")
-            session = AgentSession(driver, engine.model_runner.tokenizer)
+            session = AgentSession(driver, engine.model_runner.tokenizer, session_id=f"sanity-{i}")
             answer = session.run(task)
             for msg in session.messages:
                 content = msg["content"]
